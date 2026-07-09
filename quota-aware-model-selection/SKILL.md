@@ -1,6 +1,6 @@
 ---
 name: "quota-aware-model-selection"
-description: "Use when an agent, router, dispatcher, or automation is choosing between models, providers, accounts, quota pools, or backends using quota data such as quota-axi output."
+description: "Use when an agent, router, dispatcher, or automation is choosing between models, providers, accounts, quota pools, or backends using quota data, especially Codex multi-account routing with quota-axi output."
 version: 1
 created: "2026-07-09"
 updated: "2026-07-09"
