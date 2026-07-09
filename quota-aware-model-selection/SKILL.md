@@ -23,6 +23,11 @@ Use when deciding where an AI task should run and quota, provider limits, model 
 - Same model, Account A has 40% weekly left and resets in 3 days; Account B has 99% weekly left and resets in 1 day. Use Account B: its quota is about to reset, so spend the high remaining quota before it is wasted.
 - Same model, Account A has 40% weekly left and resets in 3 days; Account B has 100% weekly left and no reset clock yet. Use Account A, unless an explicit policy permits a tiny primer hit on B for a confirmed first-use rolling window.
 - Same model, Account A has 5% weekly left and resets in 5 hours; Account B has 80% weekly left and resets in 6 days. Use Account A for small tasks if it has enough headroom; otherwise switch to B.
+- Same model, Account A has 5% weekly left and resets soon, but the task likely needs 20%. Do not start on A and fail mid-task; use an account with enough headroom.
+- Same account has plenty of weekly quota but its 5-hour/session window is nearly exhausted. Route by the tighter active window, not just the weekly window.
+- Same model, quota data is stale or unknown. Do not make aggressive routing or primer decisions; refresh quota or choose the conservative default.
+- Same model, Account A has 2% left and resets in 30 minutes. Use it only for tiny tasks that fit safely; otherwise avoid interruption risk.
+- Multiple agents are dispatching in parallel. Avoid stampeding the same "best" account; use coordination/locking or re-check quota after assigning work.
 - Different models, stronger model has low quota and weaker model has plenty. Do not auto-downgrade if task quality would suffer; ask or follow standing policy.
 
 ## Pitfalls
@@ -31,9 +36,13 @@ Use when deciding where an AI task should run and quota, provider limits, model 
 - Do not mutate provider state, launch provider CLIs that spend quota, import cookies, or proxy requests just to inspect quota.
 - Do not make primer-hit behavior the default; it is intentional quota spend.
 - Do not ask the user for routine equivalent-account choices when policy and data make the answer clear.
+- Do not ignore smaller active windows, such as 5-hour/session/model-specific limits, when weekly quota looks healthy.
+- Do not route parallel work from stale shared quota snapshots without coordination.
 
 ## Verification
 1. Selection rationale names the decisive factors: model fit first, quota/account choice second.
 2. Equivalent-account routing, especially Codex-to-Codex, can be automatic and chooses the account with the most urgent useful quota to spend: near-reset high remaining quota first, otherwise lowest remaining quota with enough headroom.
 3. Any cross-model/provider change is either covered by standing policy or surfaced to the user/captain.
 4. No unapproved primer hit or provider-state mutation occurred.
+5. The selected account has enough headroom in every relevant active window for the expected task size.
+6. Parallel dispatchers either coordinated account assignment or refreshed quota before routing.
