@@ -1,0 +1,4 @@
+interface:
+  display_name: "Query Local Discord Cache"
+  short_description: "Inspect and index local Discord cache data"
+  default_prompt: "Use $query-local-discord-cache to inspect my local Discord data and suggest a flexible archive or FTS query."
