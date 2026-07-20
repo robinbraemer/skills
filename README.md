@@ -4,6 +4,10 @@ Public Agent Skills shared by Robin Braemer.
 
 ## Skills
 
+- [`converging-npm-trusted-publishers`](converging-npm-trusted-publishers/SKILL.md) — fail-closed guidance and a tested helper for reconciling an explicit npm package allowlist to one GitHub Actions Trusted Publisher tuple through browser-harness and the user's visible Chrome profile.
+
+  It skips exact matches, refuses unexpected publishers or UI drift, leaves WebAuthn to the human, supports redacted resume after partial completion, and requires exact post-save read-back without exposing browser or authentication material.
+
 - [`query-local-discord-cache`](query-local-discord-cache/SKILL.md) — macOS-focused guidance for locating and safely inspecting Discord's Chromium cache, LevelDB, IndexedDB, and SQLite storage.
 
   Use it to find locally cached message responses, understand which stores are likely relevant, and decide whether a flexible SQLite/FTS5 archive would make repeated querying easier. It deliberately leaves retention scope and schema design to the user.
