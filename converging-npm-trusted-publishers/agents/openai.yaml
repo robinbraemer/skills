@@ -1,0 +1,4 @@
+interface:
+  display_name: "Converge npm Trusted Publishers"
+  short_description: "Safely reconcile npm OIDC publisher settings"
+  default_prompt: "Use $converging-npm-trusted-publishers with my explicit package manifest and desired GitHub OIDC tuple."
