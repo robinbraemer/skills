@@ -33,6 +33,20 @@ def valid_manifest(**overrides):
     return data
 
 
+PREVIOUS_TUPLE = {
+    "owner": "example-org",
+    "repository": "widgets-old",
+    "workflow": "publish-old.yml",
+    "environment": None,
+}
+
+
+def valid_manifest_v2(**overrides):
+    data = valid_manifest(schema_version=2, previous_publisher=dict(PREVIOUS_TUPLE))
+    data.update(overrides)
+    return data
+
+
 class ManifestTests(unittest.TestCase):
     def load(self, data):
         with tempfile.TemporaryDirectory() as directory:
@@ -44,11 +58,13 @@ class ManifestTests(unittest.TestCase):
         manifest = self.load(valid_manifest())
 
         self.assertEqual(manifest.packages, ("@example/widgets",))
+        self.assertEqual(manifest.schema_version, 1)
         self.assertEqual(manifest.publisher.owner, "example-org")
         self.assertEqual(manifest.publisher.repository, "widgets")
         self.assertEqual(manifest.publisher.workflow, "release.yml")
         self.assertIsNone(manifest.publisher.environment)
         self.assertEqual(manifest.publisher.allowed_actions, ("npm publish",))
+        self.assertIsNone(manifest.previous_publisher)
 
     def test_rejects_unknown_keys(self):
         data = valid_manifest(extra="not-allowed")
@@ -81,18 +97,93 @@ class ManifestTests(unittest.TestCase):
             "https://www.npmjs.com/package/@example/widgets/access",
         )
 
+    def test_v2_loads_previous_publisher(self):
+        manifest = self.load(valid_manifest_v2())
 
-def model_manifest(packages=("@example/widgets",)):
+        self.assertEqual(manifest.schema_version, 2)
+        previous = manifest.previous_publisher
+        self.assertIsNotNone(previous)
+        self.assertEqual(previous.owner, "example-org")
+        self.assertEqual(previous.repository, "widgets-old")
+        self.assertEqual(previous.workflow, "publish-old.yml")
+        self.assertIsNone(previous.environment)
+        self.assertEqual(previous.allowed_actions, ("npm publish",))
+
+    def test_v2_without_previous_publisher_is_valid(self):
+        manifest = self.load(valid_manifest(schema_version=2))
+
+        self.assertIsNone(manifest.previous_publisher)
+
+    def test_v1_rejects_previous_publisher_field(self):
+        data = valid_manifest(previous_publisher=dict(PREVIOUS_TUPLE))
+
+        with self.assertRaisesRegex(MODULE.ManifestError, "unknown manifest keys"):
+            self.load(data)
+
+    def test_previous_publisher_must_differ_from_target(self):
+        data = valid_manifest_v2(
+            previous_publisher={
+                "owner": "example-org",
+                "repository": "widgets",
+                "workflow": "release.yml",
+                "environment": None,
+            }
+        )
+
+        with self.assertRaisesRegex(MODULE.ManifestError, "must differ"):
+            self.load(data)
+
+    def test_previous_publisher_allowed_actions_must_match_target_if_present(self):
+        matching = valid_manifest_v2()
+        matching["previous_publisher"]["allowed_actions"] = ["npm publish"]
+        manifest = self.load(matching)
+        self.assertEqual(manifest.previous_publisher.allowed_actions, ("npm publish",))
+
+        differing = valid_manifest_v2()
+        differing["previous_publisher"]["allowed_actions"] = ["npm stage publish"]
+        with self.assertRaisesRegex(MODULE.ManifestError, "allowed_actions"):
+            self.load(differing)
+
+    def test_digest_distinguishes_previous_publisher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with_previous = Path(directory) / "with.json"
+            with_previous.write_text(json.dumps(valid_manifest_v2()), encoding="utf-8")
+            without_previous = Path(directory) / "without.json"
+            without_previous.write_text(
+                json.dumps(valid_manifest(schema_version=2)), encoding="utf-8"
+            )
+            ledger_path = Path(directory) / "ledger.json"
+            MODULE.LedgerStore(str(ledger_path), MODULE.load_manifest(str(with_previous)))
+
+            with self.assertRaisesRegex(MODULE.LedgerError, "manifest"):
+                MODULE.LedgerStore(
+                    str(ledger_path), MODULE.load_manifest(str(without_previous))
+                )
+
+
+def model_publisher(**overrides):
+    data = {
+        "owner": "example-org",
+        "repository": "widgets",
+        "workflow": "release.yml",
+        "environment": None,
+        "allowed_actions": ("npm publish",),
+    }
+    data.update(overrides)
+    return MODULE.Publisher(**data)
+
+
+def model_manifest(packages=("@example/widgets",), previous=None):
     return MODULE.Manifest(
         packages=packages,
-        publisher=MODULE.Publisher(
-            owner="example-org",
-            repository="widgets",
-            workflow="release.yml",
-            environment=None,
-            allowed_actions=("npm publish",),
-        ),
+        publisher=model_publisher(),
+        schema_version=2 if previous is not None else 1,
+        previous_publisher=previous,
     )
+
+
+def model_previous():
+    return model_publisher(repository="widgets-old", workflow="publish-old.yml")
 
 
 class FakeDriver:
@@ -110,7 +201,7 @@ class FakeDriver:
         self.calls.append(("open", package, url))
         return package
 
-    def inspect(self, handle, package, publisher):
+    def inspect(self, handle, package, publisher, previous=None):
         self.calls.append(("inspect", package))
         if not self.observations[package]:
             raise AssertionError(f"no observation queued for {package}")
@@ -118,6 +209,9 @@ class FakeDriver:
 
     def stage(self, handle, publisher):
         self.calls.append(("stage", handle))
+
+    def migrate_stage(self, handle, previous, publisher):
+        self.calls.append(("migrate", handle))
 
     def save_and_wait(self, handle):
         self.calls.append(("save", handle))
@@ -183,12 +277,26 @@ class LedgerTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.LedgerError, "record keys"):
                 MODULE.LedgerStore(str(path), self.manifest())
 
+    def test_ledger_accepts_migrating_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.json"
+            store = MODULE.LedgerStore(str(path), self.manifest())
+            store.set("@example/widgets", "migrating")
+
+            reopened = MODULE.LedgerStore(str(path), self.manifest())
+            self.assertEqual(
+                reopened.records["@example/widgets"], {"status": "migrating"}
+            )
+
 
 class ConvergerPreflightTests(unittest.TestCase):
-    def run_with(self, manifest, driver):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        ledger = MODULE.LedgerStore(str(Path(directory.name) / "ledger.json"), manifest)
+    def run_with(self, manifest, driver, ledger=None):
+        if ledger is None:
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            ledger = MODULE.LedgerStore(
+                str(Path(directory.name) / "ledger.json"), manifest
+            )
         code = MODULE.Converger(manifest, ledger, driver).run()
         return code, ledger
 
@@ -200,7 +308,9 @@ class ConvergerPreflightTests(unittest.TestCase):
         code, ledger = self.run_with(model_manifest(), driver)
 
         self.assertEqual(code, 0)
-        self.assertFalse(any(call[0] in {"stage", "save"} for call in driver.calls))
+        self.assertFalse(
+            any(call[0] in {"stage", "migrate", "save"} for call in driver.calls)
+        )
         self.assertEqual(ledger.records[package]["status"], "exact-match")
 
     def test_unexpected_publisher_stops_before_any_write(self):
@@ -217,7 +327,9 @@ class ConvergerPreflightTests(unittest.TestCase):
         code, ledger = self.run_with(model_manifest(packages), driver)
 
         self.assertEqual(code, 3)
-        self.assertFalse(any(call[0] in {"stage", "save"} for call in driver.calls))
+        self.assertFalse(
+            any(call[0] in {"stage", "migrate", "save"} for call in driver.calls)
+        )
         self.assertEqual(
             ledger.records[packages[1]],
             {"status": "blocked", "reason": "unexpected-publisher"},
@@ -232,7 +344,9 @@ class ConvergerPreflightTests(unittest.TestCase):
         code, _ = self.run_with(model_manifest(), driver)
 
         self.assertEqual(code, 3)
-        self.assertFalse(any(call[0] in {"stage", "save"} for call in driver.calls))
+        self.assertFalse(
+            any(call[0] in {"stage", "migrate", "save"} for call in driver.calls)
+        )
 
     def test_ui_drift_stops_before_any_write(self):
         package = "@example/widgets"
@@ -241,75 +355,181 @@ class ConvergerPreflightTests(unittest.TestCase):
         code, _ = self.run_with(model_manifest(), driver)
 
         self.assertEqual(code, 3)
-        self.assertFalse(any(call[0] in {"stage", "save"} for call in driver.calls))
+        self.assertFalse(
+            any(call[0] in {"stage", "migrate", "save"} for call in driver.calls)
+        )
+
+    def test_previous_match_converges_through_migration(self):
+        package = "@example/widgets"
+        exact = MODULE.Observation("exact")
+        driver = FakeDriver(
+            {package: [MODULE.Observation("previous"), exact, exact, exact]},
+            {package: ["success"]},
+        )
+
+        code, ledger = self.run_with(model_manifest(previous=model_previous()), driver)
+
+        self.assertEqual(code, 0)
+        self.assertEqual([call[0] for call in driver.calls].count("migrate"), 1)
+        self.assertNotIn("stage", [call[0] for call in driver.calls])
+        self.assertEqual(ledger.records[package]["status"], "saved-verified")
+
+    def test_interrupted_migration_blocks_on_absent_resume(self):
+        package = "@example/widgets"
+        manifest = model_manifest(previous=model_previous())
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        ledger = MODULE.LedgerStore(str(Path(directory.name) / "ledger.json"), manifest)
+        ledger.set(package, "migrating")
+        driver = FakeDriver({package: [MODULE.Observation("absent")]})
+
+        code, ledger = self.run_with(manifest, driver, ledger=ledger)
+
+        self.assertEqual(code, 3)
+        self.assertFalse(
+            any(call[0] in {"stage", "migrate", "save"} for call in driver.calls)
+        )
+        self.assertEqual(
+            ledger.records[package],
+            {"status": "blocked", "reason": "migration-interrupted"},
+        )
+
+    def test_interrupted_migration_resumes_when_previous_is_intact(self):
+        package = "@example/widgets"
+        manifest = model_manifest(previous=model_previous())
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        ledger = MODULE.LedgerStore(str(Path(directory.name) / "ledger.json"), manifest)
+        ledger.set(package, "migrating")
+        exact = MODULE.Observation("exact")
+        driver = FakeDriver(
+            {package: [MODULE.Observation("previous"), exact, exact, exact]},
+            {package: ["success"]},
+        )
+
+        code, ledger = self.run_with(manifest, driver, ledger=ledger)
+
+        self.assertEqual(code, 0)
+        self.assertEqual([call[0] for call in driver.calls].count("migrate"), 1)
+        self.assertEqual(ledger.records[package]["status"], "saved-verified")
+
+    def test_interrupted_migration_resumes_when_target_is_already_saved(self):
+        package = "@example/widgets"
+        manifest = model_manifest(previous=model_previous())
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        ledger = MODULE.LedgerStore(str(Path(directory.name) / "ledger.json"), manifest)
+        ledger.set(package, "migrating")
+        exact = MODULE.Observation("exact")
+        driver = FakeDriver({package: [exact, exact]})
+
+        code, ledger = self.run_with(manifest, driver, ledger=ledger)
+
+        self.assertEqual(code, 0)
+        self.assertFalse(
+            any(call[0] in {"stage", "migrate", "save"} for call in driver.calls)
+        )
+        self.assertEqual(ledger.records[package]["status"], "exact-match")
 
 
 PACKAGE_URL = "https://www.npmjs.com/package/@example/widgets/access"
-FIELD_LABELS = (
-    "Organization or user",
-    "Repository",
-    "Workflow filename",
-    "Environment name (optional)",
-)
-FIELD_IDS = {
-    "Organization or user": "1_10",
-    "Repository": "1_11",
-    "Workflow filename": "1_12",
-    "Environment name (optional)": "1_13",
+FIELD_LABELS = {
+    "owner": "Organization or user*",
+    "repository": "Repository*",
+    "workflow": "Workflow filename*",
+    "environment": "Environment name",
 }
-ACTION_IDS = {"npm publish": "1_20", "npm stage publish": "1_21"}
+FIELD_IDS = {
+    "Organization or user*": "1_10",
+    "Repository*": "1_11",
+    "Workflow filename*": "1_12",
+    "Environment name": "1_13",
+}
+ACTION_IDS = {"Allow npm publish": "1_20", "Allow npm stage publish": "1_21"}
 SAVE_ID = "1_30"
-PROVIDER_IDS = {"GitHub Actions": "1_40", "GitLab CI/CD": "1_41", "CircleCI": "1_42"}
+CANCEL_ID = "1_31"
+COMBO_ID = "1_35"
+EDIT_ID = "2_10"
+DELETE_ID = "2_11"
+SAVE_LABEL = "Save changes to trusted publisher connection"
+DELETE_LABEL = "Delete OIDC trusted publisher connection"
+
+
+def summary_state(
+    owner="example-org",
+    repository="widgets-old",
+    workflow="publish-old.yml",
+    actions=("npm publish",),
+):
+    return {
+        "owner": owner,
+        "repository": repository,
+        "workflow": workflow,
+        "actions": set(actions),
+    }
 
 
 class FakeAxiTransport:
     """In-memory double of the pinned chrome-devtools-axi CLI for one npm page.
 
-    Renders real-format output: TOON page/error blocks, `snapshot:` sections
-    with generation-stamped `uid=g<N>:<id>` refs, `pages[...]` tables, and
-    STALE_REF errors when a ref's generation is no longer current.
+    Mirrors the real deployed access page: a summary view for an existing
+    connection (StaticText tuple, Edit button with tuple description, Delete
+    button) and the create/edit form (asterisked labels, Allow-prefixed
+    checkboxes, empty textboxes rendered without a value attribute). Output is
+    real-format: TOON page/error blocks, `snapshot:` sections with
+    generation-stamped `uid=g<N>:<id>` refs, `pages[...]` tables whose
+    url/selected columns are unreliable, and STALE_REF errors for old refs.
     """
 
     def __init__(
         self,
         *,
         url=PACKAGE_URL,
-        package_heading="@example/widgets",
-        section_heading="Trusted publishing",
-        values=None,
-        checked=(),
+        package_heading=(
+            "@example/widgets TypeScript icon, indicating that this package "
+            "has built-in type declarations"
+        ),
+        section_heading="Trusted Publisher",
+        publisher_state=None,
+        provider_text="GitHub Actions",
         save_result="success",
+        commit_on_save=True,
         corrupt_prefix=False,
+        corrupt_backspace=False,
         save_disabled=False,
         stale_success=False,
         auth_status_message=None,
-        provider_choice=False,
         stale_clicks=0,
         garbage_selectpage=False,
         missing_field=None,
         duplicate_field=None,
         disabled_field=None,
+        edit_prefill_override=None,
     ):
         self.url = url
         self.package_heading = package_heading
         self.section_heading = section_heading
-        self.values = {label: "" for label in FIELD_LABELS}
-        if values:
-            self.values.update(values)
-        self.checked = set(checked)
-        self.focused = None
+        self.publisher_state = publisher_state
+        self.provider_text = provider_text
         self.save_result = save_result
+        self.commit_on_save = commit_on_save
         self.corrupt_prefix = corrupt_prefix
+        self.corrupt_backspace = corrupt_backspace
         self.save_disabled = save_disabled
         self.stale_success = stale_success
         self.auth_status_message = auth_status_message
-        self.provider_choice = provider_choice
         self.stale_clicks_remaining = stale_clicks
         self.garbage_selectpage = garbage_selectpage
         self.missing_field = missing_field
         self.duplicate_field = duplicate_field
         self.disabled_field = disabled_field
+        self.edit_prefill_override = edit_prefill_override
+        self.editing = False
+        self.values = {label: "" for label in FIELD_IDS}
+        self.checked = set()
+        self.focused = None
         self.save_clicked = False
+        self.delete_clicked = False
         self.generation = 0
         self.pages = {"0": "about:blank"}
         self.selected = "0"
@@ -350,6 +570,9 @@ class FakeAxiTransport:
             self.pages[self.selected] = args[1]
             self.focused = None
             self.save_clicked = False
+            self.editing = False
+            self.values = {label: "" for label in FIELD_IDS}
+            self.checked = set()
             return self._page_output()
         if command == "click":
             return self._click(args[1])
@@ -360,6 +583,9 @@ class FakeAxiTransport:
 
     # --- interaction semantics ---
 
+    def _in_form(self):
+        return self.editing or self.publisher_state is None
+
     def _click(self, ref):
         if self.stale_clicks_remaining > 0:
             self.stale_clicks_remaining -= 1
@@ -368,24 +594,53 @@ class FakeAxiTransport:
         generation, _, node_id = stripped.partition(":")
         if generation != f"g{self.generation}":
             return self._stale_error(ref)
+        if node_id == EDIT_ID and not self._in_form():
+            state = self.edit_prefill_override or self.publisher_state
+            self.editing = True
+            self.values = {
+                FIELD_LABELS["owner"]: state["owner"],
+                FIELD_LABELS["repository"]: state["repository"],
+                FIELD_LABELS["workflow"]: state["workflow"],
+                FIELD_LABELS["environment"]: "",
+            }
+            self.checked = set(state["actions"])
+            return self._page_output()
+        if node_id == DELETE_ID:
+            self.delete_clicked = True
+            self.publisher_state = None
+            return self._page_output()
         for label, candidate in FIELD_IDS.items():
             if node_id == candidate:
                 self.focused = label
                 return self._page_output()
-        for action, candidate in ACTION_IDS.items():
+        for label, candidate in ACTION_IDS.items():
             if node_id == candidate:
+                action = label.removeprefix("Allow ")
                 self.checked.symmetric_difference_update({action})
                 return self._page_output()
         if node_id == SAVE_ID and not self.save_disabled:
             self.save_clicked = True
-            return self._page_output()
-        if node_id == PROVIDER_IDS["GitHub Actions"] and self.provider_choice:
-            self.provider_choice = False
+            if self.save_result == "success" and self.commit_on_save:
+                self.publisher_state = {
+                    "owner": self.values[FIELD_LABELS["owner"]],
+                    "repository": self.values[FIELD_LABELS["repository"]],
+                    "workflow": self.values[FIELD_LABELS["workflow"]],
+                    "actions": set(self.checked),
+                }
+                self.editing = False
             return self._page_output()
         return self._page_output()
 
     def _press(self, key):
-        if self.focused is None or len(key) != 1:
+        if self.focused is None:
+            return
+        if key == "End":
+            return
+        if key == "Backspace":
+            cut = 2 if self.corrupt_backspace else 1
+            self.values[self.focused] = self.values[self.focused][:-cut]
+            return
+        if len(key) != 1:
             return
         value = self.values[self.focused] + key
         if self.corrupt_prefix and not self.values[self.focused]:
@@ -410,37 +665,66 @@ class FakeAxiTransport:
     def _uid(self, node_id):
         return f"uid=g{self.generation}:{node_id}"
 
+    def _form_lines(self):
+        lines = [
+            f'  {self._uid(COMBO_ID)} combobox "Publisher*" expandable haspopup="menu"',
+            f'  {self._uid("1_36")} StaticText "{self.provider_text}"',
+        ]
+        for label in FIELD_IDS:
+            if label == self.missing_field:
+                continue
+            value = f' value="{self.values[label]}"' if self.values[label] else ""
+            focused = " focused" if self.focused == label else ""
+            disabled = " disabled" if label == self.disabled_field else ""
+            lines.append(
+                f'  {self._uid(FIELD_IDS[label])} textbox "{label}"'
+                f"{value} focusable{focused}{disabled}"
+            )
+            if label == self.duplicate_field:
+                lines.append(f'  {self._uid("1_99")} textbox "{label}" focusable')
+        for label, node_id in ACTION_IDS.items():
+            checked = " checked" if label.removeprefix("Allow ") in self.checked else ""
+            lines.append(f'  {self._uid(node_id)} checkbox "{label}"{checked}')
+        save_state = " disableable disabled" if self.save_disabled else ""
+        lines.append(f'  {self._uid(SAVE_ID)} button "{SAVE_LABEL}"{save_state}')
+        lines.append(
+            f'  {self._uid(CANCEL_ID)} button "Cancel trusted publisher setup"'
+        )
+        return lines
+
+    def _summary_lines(self):
+        state = self.publisher_state
+        coordinate = f"{state['owner']}/{state['repository']}"
+        lines = [
+            f'  {self._uid("2_1")} StaticText "{coordinate}"',
+            f'  {self._uid("2_2")} StaticText "{state["workflow"]}"',
+            f'  {self._uid("2_3")} StaticText "Permissions: "',
+        ]
+        for index, action in enumerate(sorted(state["actions"])):
+            lines.append(f'  {self._uid(f"2_{4 + index}")} StaticText "{action}"')
+        lines.append(
+            f'  {self._uid(EDIT_ID)} button "Edit" '
+            f'description="{coordinate} {state["workflow"]}"'
+        )
+        lines.append(f'  {self._uid(DELETE_ID)} button "{DELETE_LABEL}"')
+        return lines
+
     def _tree_lines(self):
         lines = [
             f'{self._uid("1_0")} RootWebArea "npm" url="{self.url}" focusable focused'
         ]
         if self.package_heading is not None:
-            lines.append(f'  {self._uid("1_1")} heading "{self.package_heading}" level="1"')
-        if self.section_heading is not None:
-            lines.append(f'  {self._uid("1_2")} heading "{self.section_heading}" level="2"')
-        if self.provider_choice:
-            for name, node_id in PROVIDER_IDS.items():
-                lines.append(f'  {self._uid(node_id)} button "{name}"')
-            return lines
-        for label in FIELD_LABELS:
-            if label == self.missing_field:
-                continue
-            focused = " focused" if self.focused == label else ""
-            disabled = " disabled" if label == self.disabled_field else ""
             lines.append(
-                f'  {self._uid(FIELD_IDS[label])} textbox "{label}" '
-                f'value="{self.values[label]}" focusable{focused}{disabled}'
+                f'  {self._uid("1_1")} heading "{self.package_heading}" level="1"'
             )
-            if label == self.duplicate_field:
-                lines.append(
-                    f'  {self._uid("1_99")} textbox "{label}" '
-                    f'value="{self.values[label]}" focusable'
-                )
-        for action in ("npm publish", "npm stage publish"):
-            checked = " checked" if action in self.checked else ""
-            lines.append(f'  {self._uid(ACTION_IDS[action])} checkbox "{action}"{checked}')
-        save_state = " disableable disabled" if self.save_disabled else ""
-        lines.append(f'  {self._uid(SAVE_ID)} button "Save"{save_state}')
+        if self.section_heading is not None:
+            lines.append(
+                f'  {self._uid("1_2")} heading "{self.section_heading}" level="1"'
+            )
+        if self._in_form():
+            lines.extend(self._form_lines())
+        else:
+            lines.extend(self._summary_lines())
         lines.extend(self._message_lines())
         return lines
 
@@ -512,17 +796,22 @@ def open_widget(driver):
 
 
 class AxiAdapterContractTests(unittest.TestCase):
-    def test_adapter_opens_unique_github_provider_form_before_classifying_absent(self):
-        fake = FakeAxiTransport(provider_choice=True)
+    def test_absent_form_requires_github_actions_provider(self):
+        fake = FakeAxiTransport()
         driver = make_driver(fake)
         handle = open_widget(driver)
-
         observation = driver.inspect(
-            handle, "@example/widgets", model_manifest().publisher
+            handle, "@example/widgets", model_publisher()
         )
-
         self.assertEqual(observation, MODULE.Observation("absent"))
-        self.assertFalse(fake.provider_choice)
+
+        drifted = FakeAxiTransport(provider_text="GitLab CI/CD")
+        driver = make_driver(drifted)
+        handle = open_widget(driver)
+        observation = driver.inspect(
+            handle, "@example/widgets", model_publisher()
+        )
+        self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
 
     def test_adapter_rejects_transport_without_run_command(self):
         with self.assertRaisesRegex(MODULE.HarnessError, "run command"):
@@ -543,6 +832,13 @@ class AxiAdapterContractTests(unittest.TestCase):
             with self.subTest(command=forbidden[0]):
                 with self.assertRaisesRegex(MODULE.HarnessError, "allowlisted"):
                     driver._axi(*forbidden)
+
+    def test_adapter_refuses_non_allowlisted_clearing_keys(self):
+        driver = make_driver(FakeAxiTransport())
+        for key in ("Delete", "Meta+A", "Escape", "Tab"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(MODULE.HarnessError, "allowlisted"):
+                    driver._press_named(key)
 
     def test_full_run_only_issues_allowlisted_commands(self):
         fake = FakeAxiTransport()
@@ -581,7 +877,7 @@ class AxiAdapterContractTests(unittest.TestCase):
                 driver = make_driver(fake)
                 handle = open_widget(driver)
                 observation = driver.inspect(
-                    handle, "@example/widgets", model_manifest().publisher
+                    handle, "@example/widgets", model_publisher()
                 )
                 self.assertEqual(
                     observation,
@@ -591,16 +887,27 @@ class AxiAdapterContractTests(unittest.TestCase):
         fake = FakeAxiTransport(package_heading=None)
         driver = make_driver(fake)
         handle = open_widget(driver)
-        observation = driver.inspect(
-            handle, "@example/widgets", model_manifest().publisher
-        )
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
+        self.assertEqual(observation.reason, "identity-mismatch")
+
+    def test_package_heading_with_icon_alt_suffix_is_accepted(self):
+        fake = FakeAxiTransport(package_heading="@example/widgets")
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
+        self.assertEqual(observation, MODULE.Observation("absent"))
+
+        lookalike = FakeAxiTransport(package_heading="@example/widgets-extra")
+        driver = make_driver(lookalike)
+        handle = open_widget(driver)
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
         self.assertEqual(observation.reason, "identity-mismatch")
 
     def test_adapter_rejects_ambiguous_missing_or_disabled_semantic_controls(self):
         variants = (
-            {"missing_field": "Workflow filename"},
-            {"duplicate_field": "Repository"},
-            {"disabled_field": "Organization or user"},
+            {"missing_field": "Workflow filename*"},
+            {"duplicate_field": "Repository*"},
+            {"disabled_field": "Organization or user*"},
         )
         for variant in variants:
             with self.subTest(variant=variant):
@@ -608,9 +915,62 @@ class AxiAdapterContractTests(unittest.TestCase):
                 driver = make_driver(fake)
                 handle = open_widget(driver)
                 observation = driver.inspect(
-                    handle, "@example/widgets", model_manifest().publisher
+                    handle, "@example/widgets", model_publisher()
                 )
                 self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
+
+
+class SummaryClassificationTests(unittest.TestCase):
+    def observe(self, state, previous=None):
+        fake = FakeAxiTransport(publisher_state=state)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+        return fake, driver.inspect(
+            handle, "@example/widgets", model_publisher(), previous
+        )
+
+    def test_summary_matching_target_is_exact(self):
+        state = summary_state(repository="widgets", workflow="release.yml")
+        _, observation = self.observe(state)
+        self.assertEqual(observation, MODULE.Observation("exact"))
+
+    def test_summary_matching_target_with_wrong_actions_is_unexpected(self):
+        state = summary_state(
+            repository="widgets",
+            workflow="release.yml",
+            actions=("npm publish", "npm stage publish"),
+        )
+        _, observation = self.observe(state)
+        self.assertEqual(
+            observation, MODULE.Observation("blocked", "unexpected-publisher")
+        )
+
+    def test_summary_matching_previous_is_previous_only_with_approval(self):
+        state = summary_state()
+        _, with_approval = self.observe(state, previous=model_previous())
+        self.assertEqual(with_approval, MODULE.Observation("previous"))
+
+        _, without_approval = self.observe(summary_state())
+        self.assertEqual(
+            without_approval, MODULE.Observation("blocked", "unexpected-publisher")
+        )
+
+    def test_summary_matching_neither_tuple_is_unexpected(self):
+        state = summary_state(owner="other-org", repository="legacy")
+        fake, observation = self.observe(state, previous=model_previous())
+        self.assertEqual(
+            observation, MODULE.Observation("blocked", "unexpected-publisher")
+        )
+        self.assertFalse(any(call[0] == "click" for call in fake.calls))
+
+    def test_summary_with_non_null_previous_environment_never_matches(self):
+        previous = model_publisher(
+            repository="widgets-old", workflow="publish-old.yml", environment="prod"
+        )
+        _, observation = self.observe(summary_state(), previous=previous)
+        self.assertEqual(
+            observation, MODULE.Observation("blocked", "unexpected-publisher")
+        )
 
 
 class AxiInteractionTests(unittest.TestCase):
@@ -623,20 +983,22 @@ class AxiInteractionTests(unittest.TestCase):
         fake = FakeAxiTransport()
         driver, handle = self.staged_driver(fake)
 
-        driver.stage(handle, model_manifest().publisher)
+        driver.stage(handle, model_publisher())
 
-        typed = "".join(call[1] for call in fake.calls if call[0] == "press")
+        typed = "".join(
+            call[1] for call in fake.calls if call[0] == "press" and len(call[1]) == 1
+        )
         self.assertEqual(typed, "example-orgwidgetsrelease.yml")
-        self.assertEqual(fake.values["Organization or user"], "example-org")
-        self.assertEqual(fake.values["Repository"], "widgets")
-        self.assertEqual(fake.values["Workflow filename"], "release.yml")
+        self.assertEqual(fake.values["Organization or user*"], "example-org")
+        self.assertEqual(fake.values["Repository*"], "widgets")
+        self.assertEqual(fake.values["Workflow filename*"], "release.yml")
 
     def test_text_entry_stops_on_prefix_mismatch(self):
         fake = FakeAxiTransport(corrupt_prefix=True)
         driver, handle = self.staged_driver(fake)
 
         with self.assertRaisesRegex(MODULE.HarnessError, "prefix"):
-            driver.stage(handle, model_manifest().publisher)
+            driver.stage(handle, model_publisher())
 
         self.assertEqual(len([call for call in fake.calls if call[0] == "press"]), 1)
 
@@ -644,7 +1006,7 @@ class AxiInteractionTests(unittest.TestCase):
         fake = FakeAxiTransport()
         driver, handle = self.staged_driver(fake)
 
-        driver.stage(handle, model_manifest().publisher)
+        driver.stage(handle, model_publisher())
 
         self.assertEqual(fake.checked, {"npm publish"})
         action_clicks = [
@@ -659,7 +1021,7 @@ class AxiInteractionTests(unittest.TestCase):
         fake = FakeAxiTransport(save_disabled=True)
         driver, handle = self.staged_driver(fake)
 
-        driver.stage(handle, model_manifest().publisher)
+        driver.stage(handle, model_publisher())
         outcome = driver.save_and_wait(handle)
 
         self.assertEqual(outcome, "save-failed")
@@ -676,9 +1038,9 @@ class AxiInteractionTests(unittest.TestCase):
             ("none", "authentication-ambiguous"),
         ):
             with self.subTest(result=result):
-                fake = FakeAxiTransport(save_result=result)
+                fake = FakeAxiTransport(save_result=result, commit_on_save=False)
                 driver, handle = self.staged_driver(fake, poll_attempts=2)
-                driver.stage(handle, model_manifest().publisher)
+                driver.stage(handle, model_publisher())
                 self.assertEqual(driver.save_and_wait(handle), expected)
 
     def test_authentication_status_cannot_be_overridden_by_publisher_success(self):
@@ -690,34 +1052,173 @@ class AxiInteractionTests(unittest.TestCase):
             ("Authentication verified", "success"),
         ):
             with self.subTest(message=message):
-                fake = FakeAxiTransport(auth_status_message=message)
+                fake = FakeAxiTransport(
+                    auth_status_message=message, commit_on_save=False
+                )
                 driver, handle = self.staged_driver(fake)
-                driver.stage(handle, model_manifest().publisher)
+                driver.stage(handle, model_publisher())
                 self.assertEqual(driver.save_and_wait(handle), expected)
 
     def test_save_wait_rejects_stale_success(self):
         fake = FakeAxiTransport(save_result="none", stale_success=True)
         driver, handle = self.staged_driver(fake, poll_attempts=2)
-        driver.stage(handle, model_manifest().publisher)
+        driver.stage(handle, model_publisher())
 
         outcome = driver.save_and_wait(handle)
 
         self.assertEqual(outcome, "authentication-ambiguous")
 
-    def test_reload_requires_exact_persisted_tuple(self):
-        fake = FakeAxiTransport()
-        driver, handle = self.staged_driver(fake)
-        driver.stage(handle, model_manifest().publisher)
-        fake.values["Workflow filename"] = "release.yaml"
 
-        driver.reload(handle)
-        observation = driver.inspect(
-            handle, "@example/widgets", model_manifest().publisher
-        )
+class MigrationTests(unittest.TestCase):
+    def write_manifest(self, directory, data):
+        path = Path(directory) / "manifest.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
 
+    def run_entrypoint(self, fake, manifest_data, prepare_ledger=None):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(directory, manifest_data)
+            ledger_path = Path(directory) / "ledger.json"
+            if prepare_ledger is not None:
+                manifest = MODULE.load_manifest(str(manifest_path))
+                ledger = MODULE.LedgerStore(str(ledger_path), manifest)
+                prepare_ledger(ledger)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = MODULE.run_axi(
+                    manifest_path=str(manifest_path),
+                    ledger_path=str(ledger_path),
+                    transport=fake,
+                )
+            data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        return code, data, output.getvalue()
+
+    def test_matched_previous_is_migrated_in_place_without_delete(self):
+        fake = FakeAxiTransport(publisher_state=summary_state())
+        code, ledger, _ = self.run_entrypoint(fake, valid_manifest_v2())
+
+        self.assertEqual(code, 0)
         self.assertEqual(
-            observation, MODULE.Observation("blocked", "unexpected-publisher")
+            ledger["packages"]["@example/widgets"]["status"], "saved-verified"
         )
+        self.assertFalse(fake.delete_clicked)
+        self.assertEqual(
+            fake.publisher_state,
+            {
+                "owner": "example-org",
+                "repository": "widgets",
+                "workflow": "release.yml",
+                "actions": {"npm publish"},
+            },
+        )
+        pressed = [call[1] for call in fake.calls if call[0] == "press"]
+        self.assertIn("End", pressed)
+        self.assertIn("Backspace", pressed)
+
+    def test_mismatched_existing_publisher_still_blocks(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(owner="other-org", repository="legacy")
+        )
+        code, ledger, _ = self.run_entrypoint(fake, valid_manifest_v2())
+
+        self.assertEqual(code, 3)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"],
+            {"status": "blocked", "reason": "unexpected-publisher"},
+        )
+        self.assertFalse(any(call[0] == "click" for call in fake.calls))
+        self.assertFalse(fake.editing)
+
+    def test_v1_manifest_never_migrates_an_existing_publisher(self):
+        fake = FakeAxiTransport(publisher_state=summary_state())
+        code, ledger, _ = self.run_entrypoint(fake, valid_manifest())
+
+        self.assertEqual(code, 3)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"],
+            {"status": "blocked", "reason": "unexpected-publisher"},
+        )
+        self.assertFalse(any(call[0] == "click" for call in fake.calls))
+
+    def test_interrupted_migration_fails_closed_when_publisher_is_gone(self):
+        fake = FakeAxiTransport(publisher_state=None)
+        code, ledger, _ = self.run_entrypoint(
+            fake,
+            valid_manifest_v2(),
+            prepare_ledger=lambda ledger: ledger.set("@example/widgets", "migrating"),
+        )
+
+        self.assertEqual(code, 3)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"],
+            {"status": "blocked", "reason": "migration-interrupted"},
+        )
+        self.assertFalse(any(call[0] == "press" for call in fake.calls))
+        self.assertFalse(any(call[0] == "click" for call in fake.calls))
+
+    def test_interrupted_migration_resumes_when_previous_survived(self):
+        fake = FakeAxiTransport(publisher_state=summary_state())
+        code, ledger, _ = self.run_entrypoint(
+            fake,
+            valid_manifest_v2(),
+            prepare_ledger=lambda ledger: ledger.set("@example/widgets", "migrating"),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"]["status"], "saved-verified"
+        )
+        self.assertFalse(fake.delete_clicked)
+
+    def test_interrupted_migration_resumes_when_target_already_saved(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(repository="widgets", workflow="release.yml")
+        )
+        code, ledger, _ = self.run_entrypoint(
+            fake,
+            valid_manifest_v2(),
+            prepare_ledger=lambda ledger: ledger.set("@example/widgets", "migrating"),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"]["status"], "exact-match"
+        )
+        self.assertFalse(any(call[0] == "click" for call in fake.calls))
+
+    def test_migration_readback_must_show_the_target_tuple(self):
+        fake = FakeAxiTransport(publisher_state=summary_state(), commit_on_save=False)
+        code, ledger, _ = self.run_entrypoint(fake, valid_manifest_v2())
+
+        self.assertEqual(code, 4)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"],
+            {"status": "blocked", "reason": "readback-mismatch"},
+        )
+        self.assertFalse(fake.delete_clicked)
+
+    def test_migration_clearing_readback_mismatch_stops(self):
+        fake = FakeAxiTransport(publisher_state=summary_state(), corrupt_backspace=True)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        with self.assertRaisesRegex(MODULE.HarnessError, "clearing"):
+            driver.migrate_stage(handle, model_previous(), model_publisher())
+
+        self.assertFalse(fake.delete_clicked)
+
+    def test_migration_edit_prefill_mismatch_stops(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(),
+            edit_prefill_override=summary_state(repository="tampered"),
+        )
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        with self.assertRaisesRegex(MODULE.HarnessError, "previous tuple"):
+            driver.migrate_stage(handle, model_previous(), model_publisher())
+
+        self.assertEqual(len([call for call in fake.calls if call[0] == "press"]), 0)
 
 
 class AxiStaleRefTests(unittest.TestCase):
@@ -726,7 +1227,7 @@ class AxiStaleRefTests(unittest.TestCase):
         driver = make_driver(fake)
         handle = open_widget(driver)
 
-        driver.stage(handle, model_manifest().publisher)
+        driver.stage(handle, model_publisher())
 
         clicks = [index for index, call in enumerate(fake.calls) if call[0] == "click"]
         self.assertGreaterEqual(len(clicks), 2)
@@ -739,34 +1240,34 @@ class AxiStaleRefTests(unittest.TestCase):
         handle = open_widget(driver)
 
         with self.assertRaisesRegex(MODULE.HarnessError, "stale"):
-            driver.stage(handle, model_manifest().publisher)
+            driver.stage(handle, model_publisher())
 
         self.assertEqual(
             len([call for call in fake.calls if call[0] == "click"]), 2
         )
 
-    def test_stale_provider_click_blocks_inspect_as_ui_drift(self):
-        fake = FakeAxiTransport(provider_choice=True, stale_clicks=10**6)
+    def test_stale_edit_click_blocks_migration(self):
+        fake = FakeAxiTransport(publisher_state=summary_state(), stale_clicks=10**6)
         driver = make_driver(fake)
         handle = open_widget(driver)
 
-        observation = driver.inspect(
-            handle, "@example/widgets", model_manifest().publisher
-        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "stale"):
+            driver.migrate_stage(handle, model_previous(), model_publisher())
 
-        self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
+        self.assertFalse(fake.editing)
+        self.assertFalse(fake.delete_clicked)
 
     def test_refs_are_passed_back_exactly_as_printed_with_generation_prefix(self):
         fake = FakeAxiTransport()
         driver = make_driver(fake)
         handle = open_widget(driver)
 
-        driver.stage(handle, model_manifest().publisher)
+        driver.stage(handle, model_publisher())
 
         clicks = [call[1] for call in fake.calls if call[0] == "click"]
         self.assertTrue(clicks)
         for ref in clicks:
-            self.assertRegex(ref, r"^@g\d+:1_\d+$")
+            self.assertRegex(ref, r"^@g\d+:[12]_\d+$")
 
     def test_non_stale_axi_error_fails_closed(self):
         fake = FakeAxiTransport()
@@ -780,8 +1281,6 @@ class AxiStaleRefTests(unittest.TestCase):
         try:
             with self.assertRaises(MODULE.HarnessError):
                 driver._axi("snapshot", "--full")
-            with self.assertRaises(MODULE.StaleRefError):
-                raise MODULE.StaleRefError("sanity: subclass relationship")
         finally:
             fake.run = original_run
 
@@ -792,9 +1291,7 @@ class AxiSnapshotParseTests(unittest.TestCase):
         driver = make_driver(fake)
         handle = open_widget(driver)
 
-        observation = driver.inspect(
-            handle, "@example/widgets", model_manifest().publisher
-        )
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
 
         self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
 
@@ -843,7 +1340,7 @@ class AxiSnapshotParseTests(unittest.TestCase):
             "snapshot:\n"
             'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
             '  uid=g1:1_9 button "He said "hi"" focusable\n'
-            '  uid=g1:1_8 checkbox "npm publish" checked="true"\n'
+            '  uid=g1:1_8 checkbox "Allow npm publish" checked="true"\n'
         )
         _, nodes = driver._parse_page(page)
 
@@ -885,12 +1382,7 @@ class AxiEntrypointTests(unittest.TestCase):
 
     def test_entrypoint_converges_exact_match_with_restricted_transport(self):
         fake = FakeAxiTransport(
-            values={
-                "Organization or user": "example-org",
-                "Repository": "widgets",
-                "Workflow filename": "release.yml",
-            },
-            checked=("npm publish",),
+            publisher_state=summary_state(repository="widgets", workflow="release.yml")
         )
         with tempfile.TemporaryDirectory() as directory:
             manifest = self.write_manifest(directory)
@@ -998,6 +1490,25 @@ class ConvergerSequentialTests(unittest.TestCase):
         self.assertEqual(ledger.records[packages[0]]["status"], "saved-verified")
         self.assertEqual(
             ledger.records[packages[1]],
+            {"status": "blocked", "reason": "authentication-failed"},
+        )
+
+    def test_migration_authentication_failure_keeps_migrating_context(self):
+        package = "@example/widgets"
+        exact = MODULE.Observation("exact")
+        driver = FakeDriver(
+            {package: [MODULE.Observation("previous"), exact]},
+            {package: ["authentication-failed"]},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = model_manifest(previous=model_previous())
+            ledger = self.make_ledger(directory, manifest)
+
+            code = MODULE.Converger(manifest, ledger, driver).run()
+
+        self.assertEqual(code, 4)
+        self.assertEqual(
+            ledger.records[package],
             {"status": "blocked", "reason": "authentication-failed"},
         )
 

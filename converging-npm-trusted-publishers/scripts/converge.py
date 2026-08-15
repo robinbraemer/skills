@@ -28,6 +28,7 @@ LEDGER_STATUSES = {
     "exact-match",
     "staged",
     "awaiting-human-auth",
+    "migrating",
     "saved-verified",
     "blocked",
 }
@@ -38,13 +39,25 @@ PINNED_AXI_VERSION = "0.1.29"
 AXI_ALLOWED_COMMANDS = frozenset(
     {"newpage", "selectpage", "pages", "snapshot", "click", "press", "open"}
 )
-PROVIDER_NAMES = ("GitHub Actions", "GitLab CI/CD", "CircleCI")
+# Named keys allowed for clearing a prefilled field during an authorized
+# migration edit. Every press is followed by an exact value read-back.
+CLEARING_KEYS = ("End", "Backspace")
+# Semantic contract of the real npm access page (read from live snapshots of
+# the deployed UI; any deviation is UI drift and stops the run).
+SECTION_HEADING = "Trusted Publisher"
 FIELD_LABELS = {
-    "owner": "Organization or user",
-    "repository": "Repository",
-    "workflow": "Workflow filename",
-    "environment": "Environment name (optional)",
+    "owner": "Organization or user*",
+    "repository": "Repository*",
+    "workflow": "Workflow filename*",
+    "environment": "Environment name",
 }
+ACTION_CHECKBOX_LABELS = {action: f"Allow {action}" for action in SUPPORTED_ACTIONS}
+PROVIDER_COMBOBOX_LABEL = "Publisher*"
+PROVIDER_NAME = "GitHub Actions"
+SAVE_BUTTON_LABEL = "Save changes to trusted publisher connection"
+EDIT_BUTTON_LABEL = "Edit"
+DELETE_BUTTON_LABEL = "Delete OIDC trusted publisher connection"
+PERMISSIONS_LABEL = "Permissions: "
 BLOCK_REASONS = {
     "unexpected-publisher",
     "identity-mismatch",
@@ -54,6 +67,7 @@ BLOCK_REASONS = {
     "save-failed",
     "partial-save",
     "readback-mismatch",
+    "migration-interrupted",
     "harness-error",
 }
 
@@ -82,11 +96,16 @@ class Publisher:
     environment: str | None
     allowed_actions: tuple[str, ...]
 
+    def tuple_key(self) -> tuple[str, str, str, str | None]:
+        return (self.owner, self.repository, self.workflow, self.environment)
+
 
 @dataclass(frozen=True)
 class Manifest:
     packages: tuple[str, ...]
     publisher: Publisher
+    schema_version: int = 1
+    previous_publisher: Publisher | None = None
 
 
 @dataclass(frozen=True)
@@ -95,7 +114,7 @@ class Observation:
     reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.state not in {"absent", "exact", "blocked"}:
+        if self.state not in {"absent", "exact", "previous", "blocked"}:
             raise ValueError("invalid observation state")
         if self.state == "blocked":
             if self.reason not in BLOCK_REASONS:
@@ -104,17 +123,23 @@ class Observation:
             raise ValueError("only blocked observations may have a reason")
 
 
-def _exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+def _checked_keys(
+    value: Any, required: set[str], optional: set[str], label: str
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ManifestError(f"{label} must be an object")
     actual = set(value)
-    unknown = sorted(actual - expected)
-    missing = sorted(expected - actual)
+    unknown = sorted(actual - required - optional)
+    missing = sorted(required - actual)
     if unknown:
         raise ManifestError(f"unknown {label} keys: {', '.join(unknown)}")
     if missing:
         raise ManifestError(f"missing {label} keys: {', '.join(missing)}")
     return value
+
+
+def _exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+    return _checked_keys(value, expected, set(), label)
 
 
 def _string(value: Any, label: str) -> str:
@@ -125,15 +150,51 @@ def _string(value: Any, label: str) -> str:
     return value
 
 
+def _load_publisher_fields(value: Mapping[str, Any]) -> tuple[str, str, str, str | None]:
+    owner = _string(value["owner"], "owner")
+    if not OWNER_RE.fullmatch(owner):
+        raise ManifestError("owner is not a valid GitHub owner")
+    repository = _string(value["repository"], "repository")
+    if not REPOSITORY_RE.fullmatch(repository):
+        raise ManifestError("repository is not a valid GitHub repository name")
+    workflow = _string(value["workflow"], "workflow")
+    if not WORKFLOW_RE.fullmatch(workflow):
+        raise ManifestError("workflow must be a .yml or .yaml filename, not a path")
+    environment_value = value["environment"]
+    if environment_value is None:
+        environment = None
+    else:
+        environment = _string(environment_value, "environment")
+    return owner, repository, workflow, environment
+
+
+def _load_allowed_actions(actions_value: Any) -> tuple[str, ...]:
+    if not isinstance(actions_value, list) or not actions_value:
+        raise ManifestError("allowed_actions must be a non-empty array")
+    if any(not isinstance(action, str) for action in actions_value):
+        raise ManifestError("allowed_actions must contain strings")
+    if len(set(actions_value)) != len(actions_value):
+        raise ManifestError("allowed_actions must not contain duplicates")
+    unsupported = sorted(set(actions_value) - set(SUPPORTED_ACTIONS))
+    if unsupported:
+        raise ManifestError("allowed_actions contains an unsupported action")
+    return tuple(action for action in SUPPORTED_ACTIONS if action in actions_value)
+
+
 def load_manifest(path: str) -> Manifest:
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ManifestError(f"cannot read manifest: {error.__class__.__name__}") from error
 
-    root = _exact_keys(raw, {"schema_version", "packages", "publisher"}, "manifest")
-    if root["schema_version"] != 1 or isinstance(root["schema_version"], bool):
-        raise ManifestError("schema_version must equal 1")
+    if not isinstance(raw, dict):
+        raise ManifestError("manifest must be an object")
+    schema_version = raw.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version not in (1, 2):
+        raise ManifestError("schema_version must equal 1 or 2")
+    required = {"schema_version", "packages", "publisher"}
+    optional = {"previous_publisher"} if schema_version == 2 else set()
+    root = _checked_keys(raw, required, optional, "manifest")
 
     packages_value = root["packages"]
     if not isinstance(packages_value, list) or not packages_value:
@@ -152,43 +213,48 @@ def load_manifest(path: str) -> Manifest:
         {"owner", "repository", "workflow", "environment", "allowed_actions"},
         "publisher",
     )
-    owner = _string(publisher_value["owner"], "owner")
-    if not OWNER_RE.fullmatch(owner):
-        raise ManifestError("owner is not a valid GitHub owner")
-    repository = _string(publisher_value["repository"], "repository")
-    if not REPOSITORY_RE.fullmatch(repository):
-        raise ManifestError("repository is not a valid GitHub repository name")
-    workflow = _string(publisher_value["workflow"], "workflow")
-    if not WORKFLOW_RE.fullmatch(workflow):
-        raise ManifestError("workflow must be a .yml or .yaml filename, not a path")
+    owner, repository, workflow, environment = _load_publisher_fields(publisher_value)
+    allowed_actions = _load_allowed_actions(publisher_value["allowed_actions"])
+    publisher = Publisher(
+        owner=owner,
+        repository=repository,
+        workflow=workflow,
+        environment=environment,
+        allowed_actions=allowed_actions,
+    )
 
-    environment_value = publisher_value["environment"]
-    if environment_value is None:
-        environment = None
-    else:
-        environment = _string(environment_value, "environment")
-
-    actions_value = publisher_value["allowed_actions"]
-    if not isinstance(actions_value, list) or not actions_value:
-        raise ManifestError("allowed_actions must be a non-empty array")
-    if any(not isinstance(action, str) for action in actions_value):
-        raise ManifestError("allowed_actions must contain strings")
-    if len(set(actions_value)) != len(actions_value):
-        raise ManifestError("allowed_actions must not contain duplicates")
-    unsupported = sorted(set(actions_value) - set(SUPPORTED_ACTIONS))
-    if unsupported:
-        raise ManifestError("allowed_actions contains an unsupported action")
-    allowed_actions = tuple(action for action in SUPPORTED_ACTIONS if action in actions_value)
+    previous_publisher: Publisher | None = None
+    if "previous_publisher" in root:
+        previous_value = _checked_keys(
+            root["previous_publisher"],
+            {"owner", "repository", "workflow", "environment"},
+            {"allowed_actions"},
+            "previous_publisher",
+        )
+        p_owner, p_repository, p_workflow, p_environment = _load_publisher_fields(
+            previous_value
+        )
+        if "allowed_actions" in previous_value:
+            previous_actions = _load_allowed_actions(previous_value["allowed_actions"])
+            if previous_actions != allowed_actions:
+                raise ManifestError(
+                    "previous_publisher allowed_actions must be omitted or equal the target's"
+                )
+        previous_publisher = Publisher(
+            owner=p_owner,
+            repository=p_repository,
+            workflow=p_workflow,
+            environment=p_environment,
+            allowed_actions=allowed_actions,
+        )
+        if previous_publisher.tuple_key() == publisher.tuple_key():
+            raise ManifestError("previous_publisher must differ from publisher")
 
     return Manifest(
         packages=tuple(packages),
-        publisher=Publisher(
-            owner=owner,
-            repository=repository,
-            workflow=workflow,
-            environment=environment,
-            allowed_actions=allowed_actions,
-        ),
+        publisher=publisher,
+        schema_version=schema_version,
+        previous_publisher=previous_publisher,
     )
 
 
@@ -198,19 +264,25 @@ def package_url(package: str) -> str:
     return f"https://www.npmjs.com/package/{quote(package, safe='@/')}/access"
 
 
-def _manifest_data(manifest: Manifest) -> dict[str, Any]:
-    publisher = manifest.publisher
+def _publisher_data(publisher: Publisher) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "packages": list(manifest.packages),
-        "publisher": {
-            "owner": publisher.owner,
-            "repository": publisher.repository,
-            "workflow": publisher.workflow,
-            "environment": publisher.environment,
-            "allowed_actions": list(publisher.allowed_actions),
-        },
+        "owner": publisher.owner,
+        "repository": publisher.repository,
+        "workflow": publisher.workflow,
+        "environment": publisher.environment,
+        "allowed_actions": list(publisher.allowed_actions),
     }
+
+
+def _manifest_data(manifest: Manifest) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "schema_version": manifest.schema_version,
+        "packages": list(manifest.packages),
+        "publisher": _publisher_data(manifest.publisher),
+    }
+    if manifest.previous_publisher is not None:
+        data["previous_publisher"] = _publisher_data(manifest.previous_publisher)
+    return data
 
 
 def manifest_digest(manifest: Manifest) -> str:
@@ -396,7 +468,9 @@ class AxiDriver:
     Element targeting is always role+name against a fresh accessibility
     snapshot; generation-tagged refs are passed back exactly as printed, and a
     STALE_REF answer gets exactly one fresh re-snapshot retry before the run
-    fails closed.
+    fails closed. An existing connection is only ever changed through the
+    page's own in-place Edit form, and only when its tuple exactly matches the
+    manifest's approved previous_publisher; the Delete control is never used.
     """
 
     def __init__(
@@ -571,8 +645,14 @@ class AxiDriver:
         return matches[0]
 
     @staticmethod
-    def _value(node: AxNode) -> Any:
-        return node.attrs.get("value")
+    def _field_value(node: AxNode) -> str:
+        value = node.attrs.get("value")
+        if value is None:
+            # The real npm UI omits the value attribute on empty textboxes.
+            return ""
+        if not isinstance(value, str):
+            raise HarnessError("textbox has no readable value")
+        return value
 
     @staticmethod
     def _checked(node: AxNode) -> bool:
@@ -583,13 +663,28 @@ class AxiDriver:
             return False
         raise HarnessError("allowed-action control has no boolean checked state")
 
+    @staticmethod
+    def _package_headings(tree: list[AxNode], package: str) -> list[AxNode]:
+        # The real page appends icon alt text to the package heading
+        # (e.g. "@scope/pkg TypeScript icon, ..."), so accept an exact name or
+        # the package name followed by a space.
+        return [
+            node
+            for node in tree
+            if node.role == "heading"
+            and node.attrs.get("level") == "1"
+            and (node.name == package or node.name.startswith(f"{package} "))
+        ]
+
     def _form(self, tree: list[AxNode]) -> dict[str, AxNode]:
         controls: dict[str, AxNode] = {}
+        controls["provider"] = self._one(tree, "combobox", PROVIDER_COMBOBOX_LABEL)
+        self._one(tree, "StaticText", PROVIDER_NAME)
         for field, label in FIELD_LABELS.items():
             controls[field] = self._one(tree, "textbox", label)
-        for action in SUPPORTED_ACTIONS:
-            controls[action] = self._one(tree, "checkbox", action)
-        controls["save"] = self._one(tree, "button", "Save")
+        for action, label in ACTION_CHECKBOX_LABELS.items():
+            controls[action] = self._one(tree, "checkbox", label)
+        controls["save"] = self._one(tree, "button", SAVE_BUTTON_LABEL)
         for name, control in controls.items():
             if name != "save" and "disabled" in control.attrs:
                 raise HarnessError("semantic control is disabled")
@@ -597,14 +692,49 @@ class AxiDriver:
             self._checked(controls[action])
         return controls
 
+    def _summary(self, tree: list[AxNode]) -> tuple[str, str, str, set[str]]:
+        """Parse the existing-connection summary view into its visible tuple.
+
+        The Edit button's machine-readable description ("owner/repo workflow")
+        must be corroborated by the visible StaticText nodes; any disagreement
+        is drift. The environment is not rendered in this view, so only
+        environment-less tuples can ever be matched from a summary.
+        """
+        edit = self._one(tree, "button", EDIT_BUTTON_LABEL)
+        if "disabled" in edit.attrs:
+            raise HarnessError("edit control is disabled")
+        self._one(tree, "button", DELETE_BUTTON_LABEL)
+        description = edit.attrs.get("description")
+        if not isinstance(description, str):
+            raise HarnessError("edit control has no tuple description")
+        coordinate, separator, workflow = description.rpartition(" ")
+        owner, slash, repository = coordinate.partition("/")
+        if (
+            separator != " "
+            or slash != "/"
+            or not OWNER_RE.fullmatch(owner)
+            or not REPOSITORY_RE.fullmatch(repository)
+            or not WORKFLOW_RE.fullmatch(workflow)
+        ):
+            raise HarnessError("edit control description is not a publisher tuple")
+        self._one(tree, "StaticText", coordinate)
+        self._one(tree, "StaticText", workflow)
+        self._one(tree, "StaticText", PERMISSIONS_LABEL)
+        actions = {
+            action
+            for action in SUPPORTED_ACTIONS
+            if len(self._matches(tree, "StaticText", action)) == 1
+        }
+        return owner, repository, workflow, actions
+
     def _verify_identity(self, handle: Any, url: str, tree: list[AxNode]) -> None:
         package, expected_url = self._expected(handle)
         if url != expected_url:
             raise HarnessError("package page identity changed")
-        if len(self._matches(tree, "heading", package)) != 1:
+        if len(self._package_headings(tree, package)) != 1:
             raise HarnessError("visible package identity changed")
-        if len(self._matches(tree, "heading", "Trusted publishing")) != 1:
-            raise HarnessError("Trusted publishing section changed")
+        if len(self._matches(tree, "heading", SECTION_HEADING)) != 1:
+            raise HarnessError("Trusted Publisher section changed")
 
     def _current(self, handle: Any) -> tuple[str, list[AxNode], dict[str, AxNode]]:
         package, _ = self._expected(handle)
@@ -632,42 +762,133 @@ class AxiDriver:
                 ) from error
         return self._parse_page(stdout)
 
-    def _press(self, key: str) -> tuple[str, list[AxNode]]:
+    def _press_char(self, key: str) -> tuple[str, list[AxNode]]:
         if len(key) != 1 or ord(key) < 32 or ord(key) == 127:
-            raise HarnessError("only single printable characters may be pressed")
+            raise HarnessError("only single printable characters may be typed")
         return self._parse_page(self._axi("press", key, "--full"))
+
+    def _press_named(self, key: str) -> tuple[str, list[AxNode]]:
+        if key not in CLEARING_KEYS:
+            raise HarnessError("named key is not allowlisted for clearing")
+        return self._parse_page(self._axi("press", key, "--full"))
+
+    def _verified_form_field(
+        self, handle: Any, url: str, tree: list[AxNode], field: str
+    ) -> AxNode:
+        self._verify_identity(handle, url, tree)
+        controls = self._form(tree)
+        node = controls[field]
+        if node.attrs.get("focused") is not True:
+            raise HarnessError("textbox lost focus during keyboard input")
+        return node
+
+    def _focus_field(
+        self, handle: Any, tree: list[AxNode], field: str
+    ) -> tuple[str, list[AxNode]]:
+        url, tree = self._click_control(handle, tree, "textbox", FIELD_LABELS[field])
+        node = self._verified_form_field(handle, url, tree, field)
+        return url, tree
+
+    def _clear_field(
+        self, handle: Any, tree: list[AxNode], field: str, current: str
+    ) -> tuple[str, list[AxNode]]:
+        """Empty a prefilled field with End + per-key Backspace read-back."""
+        url, tree = self._press_named("End")
+        node = self._verified_form_field(handle, url, tree, field)
+        if self._field_value(node) != current:
+            raise HarnessError("textbox changed while positioning the caret")
+        remaining = current
+        while remaining:
+            url, tree = self._press_named("Backspace")
+            remaining = remaining[:-1]
+            node = self._verified_form_field(handle, url, tree, field)
+            if self._field_value(node) != remaining:
+                raise HarnessError("textbox clearing read-back mismatch")
+        return url, tree
+
+    def _type_field(
+        self, handle: Any, tree: list[AxNode], field: str, desired: str
+    ) -> tuple[str, list[AxNode]]:
+        prefix = ""
+        url = ""
+        for character in desired:
+            url, tree = self._press_char(character)
+            prefix += character
+            node = self._verified_form_field(handle, url, tree, field)
+            if self._field_value(node) != prefix:
+                raise HarnessError("textbox prefix read-back mismatch")
+        return url, tree
+
+    def _set_actions(self, handle: Any, desired_actions: set[str]) -> None:
+        for action in SUPPORTED_ACTIONS:
+            _, tree, controls = self._current(handle)
+            if self._checked(controls[action]) == (action in desired_actions):
+                continue
+            label = ACTION_CHECKBOX_LABELS[action]
+            url, tree = self._click_control(handle, tree, "checkbox", label)
+            self._verify_identity(handle, url, tree)
+            refreshed = self._form(tree)
+            if self._checked(refreshed[action]) != (action in desired_actions):
+                raise HarnessError("allowed-action read-back mismatch")
+
+    def _verify_staged(self, handle: Any, publisher: Publisher) -> None:
+        _, _, controls = self._current(handle)
+        final_values = {
+            field: self._field_value(controls[field]) for field in FIELD_LABELS
+        }
+        final_actions = {
+            action
+            for action in SUPPORTED_ACTIONS
+            if self._checked(controls[action]) is True
+        }
+        if final_values != _desired_values(publisher) or final_actions != set(
+            publisher.allowed_actions
+        ):
+            raise HarnessError("staged form read-back mismatch")
 
     # --- driver surface used by the converger ---
 
-    def inspect(self, handle: Any, package: str, publisher: Publisher) -> Observation:
+    def inspect(
+        self,
+        handle: Any,
+        package: str,
+        publisher: Publisher,
+        previous: Publisher | None = None,
+    ) -> Observation:
         try:
             url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
             if url != package_url(package):
                 return Observation("blocked", "identity-mismatch")
-            if len(self._matches(tree, "heading", package)) != 1:
+            if len(self._package_headings(tree, package)) != 1:
                 return Observation("blocked", "identity-mismatch")
-            if len(self._matches(tree, "heading", "Trusted publishing")) != 1:
+            if len(self._matches(tree, "heading", SECTION_HEADING)) != 1:
                 return Observation("blocked", "ui-drift")
-            try:
-                controls = self._form(tree)
-            except HarnessError:
-                providers = {
-                    name: self._one(tree, "button", name) for name in PROVIDER_NAMES
-                }
-                if any("disabled" in node.attrs for node in providers.values()):
-                    raise HarnessError("provider selection is unavailable")
-                url, tree = self._click_control(handle, tree, "button", "GitHub Actions")
-                if url != package_url(package) or len(
-                    self._matches(tree, "heading", package)
-                ) != 1 or len(self._matches(tree, "heading", "Trusted publishing")) != 1:
-                    raise HarnessError("provider form changed package identity")
-                controls = self._form(tree)
+            if self._matches(tree, "button", EDIT_BUTTON_LABEL):
+                return self._classify_summary(tree, publisher, previous)
+            return self._classify_form(self._form(tree), publisher, previous)
         except HarnessError:
             return Observation("blocked", "ui-drift")
 
-        values = {field: self._value(controls[field]) for field in FIELD_LABELS}
-        if any(not isinstance(value, str) for value in values.values()):
-            return Observation("blocked", "ui-drift")
+    def _classify_summary(
+        self, tree: list[AxNode], publisher: Publisher, previous: Publisher | None
+    ) -> Observation:
+        owner, repository, workflow, actions = self._summary(tree)
+        observed = (owner, repository, workflow, None)
+        if observed == publisher.tuple_key() and actions == set(
+            publisher.allowed_actions
+        ):
+            return Observation("exact")
+        if previous is not None and observed == previous.tuple_key():
+            return Observation("previous")
+        return Observation("blocked", "unexpected-publisher")
+
+    def _classify_form(
+        self,
+        controls: dict[str, AxNode],
+        publisher: Publisher,
+        previous: Publisher | None,
+    ) -> Observation:
+        values = {field: self._field_value(controls[field]) for field in FIELD_LABELS}
         checked = {
             action
             for action in SUPPORTED_ACTIONS
@@ -675,72 +896,77 @@ class AxiDriver:
         }
         if all(value == "" for value in values.values()) and not checked:
             return Observation("absent")
-        desired_values = {
-            "owner": publisher.owner,
-            "repository": publisher.repository,
-            "workflow": publisher.workflow,
-            "environment": publisher.environment or "",
-        }
-        if values == desired_values and checked == set(publisher.allowed_actions):
+        if values == _desired_values(publisher) and checked == set(
+            publisher.allowed_actions
+        ):
             return Observation("exact")
+        if previous is not None and values == _desired_values(previous):
+            return Observation("previous")
         return Observation("blocked", "unexpected-publisher")
 
     def stage(self, handle: Any, publisher: Publisher) -> None:
-        desired_values = {
-            "owner": publisher.owner,
-            "repository": publisher.repository,
-            "workflow": publisher.workflow,
-            "environment": publisher.environment or "",
-        }
+        """Fill the empty create form (absent publisher) with the target tuple."""
+        desired_values = _desired_values(publisher)
         for field, desired in desired_values.items():
             _, tree, controls = self._current(handle)
-            if self._value(controls[field]) != "":
+            if self._field_value(controls[field]) != "":
                 raise HarnessError("textbox is not empty before staging")
             if desired == "":
                 continue
-            url, tree = self._click_control(
-                handle, tree, "textbox", FIELD_LABELS[field]
-            )
-            self._verify_identity(handle, url, tree)
-            controls = self._form(tree)
-            node = controls[field]
-            if node.attrs.get("focused") is not True:
-                raise HarnessError("textbox did not receive visible focus")
-            if self._value(node) != "":
+            url, tree = self._focus_field(handle, tree, field)
+            node = self._form(tree)[field]
+            if self._field_value(node) != "":
                 raise HarnessError("textbox changed before keyboard input")
-            prefix = ""
-            for character in desired:
-                url, tree = self._press(character)
-                prefix += character
-                self._verify_identity(handle, url, tree)
-                controls = self._form(tree)
-                node = controls[field]
-                if node.attrs.get("focused") is not True:
-                    raise HarnessError("textbox lost focus during keyboard input")
-                if self._value(node) != prefix:
-                    raise HarnessError("textbox prefix read-back mismatch")
+            url, tree = self._type_field(handle, tree, field, desired)
 
-        desired_actions = set(publisher.allowed_actions)
         for action in SUPPORTED_ACTIONS:
-            _, tree, controls = self._current(handle)
+            _, _, controls = self._current(handle)
             if self._checked(controls[action]) is not False:
                 raise HarnessError("allowed-action form was not initially empty")
-            if action in desired_actions:
-                url, tree = self._click_control(handle, tree, "checkbox", action)
-                self._verify_identity(handle, url, tree)
-                refreshed = self._form(tree)
-                if self._checked(refreshed[action]) is not True:
-                    raise HarnessError("allowed-action read-back mismatch")
+        self._set_actions(handle, set(publisher.allowed_actions))
+        self._verify_staged(handle, publisher)
 
-        _, _, controls = self._current(handle)
-        final_values = {field: self._value(controls[field]) for field in FIELD_LABELS}
-        final_actions = {
-            action
-            for action in SUPPORTED_ACTIONS
-            if self._checked(controls[action]) is True
-        }
-        if final_values != desired_values or final_actions != desired_actions:
-            raise HarnessError("staged form read-back mismatch")
+    def migrate_stage(
+        self, handle: Any, previous: Publisher, publisher: Publisher
+    ) -> None:
+        """Rewrite the approved previous tuple to the target via in-place Edit.
+
+        Opens the page's own Edit form (never Delete), verifies every prefilled
+        value equals the approved previous tuple, then per-field clears and
+        retypes only the fields that differ, with a read-back after every key.
+        Nothing is persisted until save_and_wait clicks Save.
+        """
+        package, _ = self._expected(handle)
+        url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
+        self._verify_identity(handle, url, tree)
+        observed = self._summary(tree)
+        if (observed[0], observed[1], observed[2], None) != previous.tuple_key():
+            raise HarnessError("summary tuple changed before editing")
+        url, tree = self._click_control(handle, tree, "button", EDIT_BUTTON_LABEL)
+        self._verify_identity(handle, url, tree)
+        controls = self._form(tree)
+
+        previous_values = _desired_values(previous)
+        desired_values = _desired_values(publisher)
+        for field in FIELD_LABELS:
+            if self._field_value(controls[field]) != previous_values[field]:
+                raise HarnessError("edit form does not show the approved previous tuple")
+
+        for field, desired in desired_values.items():
+            current = previous_values[field]
+            if desired == current:
+                continue
+            _, tree, controls = self._current(handle)
+            if self._field_value(controls[field]) != current:
+                raise HarnessError("textbox changed before editing")
+            url, tree = self._focus_field(handle, tree, field)
+            if current:
+                url, tree = self._clear_field(handle, tree, field, current)
+            if desired:
+                url, tree = self._type_field(handle, tree, field, desired)
+
+        self._set_actions(handle, set(publisher.allowed_actions))
+        self._verify_staged(handle, publisher)
 
     @staticmethod
     def _messages(tree: list[AxNode]) -> Counter:
@@ -756,13 +982,13 @@ class AxiDriver:
         if "disabled" in save.attrs:
             return "save-failed"
         baseline_messages = self._messages(tree)
-        url, tree = self._click_control(handle, tree, "button", "Save")
+        url, tree = self._click_control(handle, tree, "button", SAVE_BUTTON_LABEL)
 
         for attempt in range(self.poll_attempts):
             package, expected_url = self._expected(handle)
             if url != expected_url:
                 return "save-failed"
-            if len(self._matches(tree, "heading", package)) != 1:
+            if len(self._package_headings(tree, package)) != 1:
                 return "save-failed"
             messages = self._messages(tree) - baseline_messages
             new_messages = [
@@ -818,7 +1044,7 @@ class AxiDriver:
                     return "save-failed"
             for _, lowered in new_messages:
                 if "trusted publisher" in lowered and re.search(
-                    r"\b(saved|added|configured|success|successful|successfully)\b",
+                    r"\b(saved|added|updated|configured|success|successful|successfully)\b",
                     lowered,
                 ):
                     return "success"
@@ -828,9 +1054,20 @@ class AxiDriver:
         return "authentication-ambiguous"
 
     def reload(self, handle: Any) -> None:
-        self._current(handle)
-        _, expected_url = self._expected(handle)
+        package, expected_url = self._expected(handle)
+        url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
+        if url != expected_url:
+            raise HarnessError("package page identity changed")
         self._axi("open", expected_url, "--full")
+
+
+def _desired_values(publisher: Publisher) -> dict[str, str]:
+    return {
+        "owner": publisher.owner,
+        "repository": publisher.repository,
+        "workflow": publisher.workflow,
+        "environment": publisher.environment or "",
+    }
 
 
 class Converger:
@@ -845,38 +1082,57 @@ class Converger:
         return code
 
     def run(self) -> int:
+        publisher = self.manifest.publisher
+        previous = self.manifest.previous_publisher
         for package in self.manifest.packages:
             self.handles[package] = self.driver.open_package(
                 package, package_url(package)
             )
 
-        pending: list[str] = []
+        pending: list[tuple[str, str]] = []
         for package in self.manifest.packages:
+            prior_status = self.ledger.records[package]["status"]
             observation = self.driver.inspect(
-                self.handles[package], package, self.manifest.publisher
+                self.handles[package], package, publisher, previous
             )
             if observation.state == "blocked":
                 return self._blocked(package, observation.reason or "ui-drift", 3)
             if observation.state == "exact":
-                prior_status = self.ledger.records[package]["status"]
                 status = (
                     "saved-verified"
                     if prior_status == "saved-verified"
                     else "exact-match"
                 )
                 self.ledger.set(package, status)
-            else:
+            elif observation.state == "previous":
                 self.ledger.set(package, "pending")
-                pending.append(package)
+                pending.append((package, "migrate"))
+            else:
+                if prior_status == "migrating":
+                    # A migration edit was in flight when the last run died and
+                    # the publisher is now gone. Never repair that ambiguity
+                    # automatically.
+                    return self._blocked(package, "migration-interrupted", 3)
+                self.ledger.set(package, "pending")
+                pending.append((package, "create"))
 
-        for package in pending:
+        for package, mode in pending:
             handle = self.handles[package]
-            self.driver.stage(handle, self.manifest.publisher)
-            staged = self.driver.inspect(handle, package, self.manifest.publisher)
-            if staged.state != "exact":
-                return self._blocked(package, "partial-save", 4)
-            self.ledger.set(package, "staged")
-            self.ledger.set(package, "awaiting-human-auth")
+            if mode == "migrate":
+                if previous is None:
+                    return self._blocked(package, "unexpected-publisher", 3)
+                self.ledger.set(package, "migrating")
+                self.driver.migrate_stage(handle, previous, publisher)
+                staged = self.driver.inspect(handle, package, publisher, previous)
+                if staged.state != "exact":
+                    return self._blocked(package, "partial-save", 4)
+            else:
+                self.driver.stage(handle, publisher)
+                staged = self.driver.inspect(handle, package, publisher, previous)
+                if staged.state != "exact":
+                    return self._blocked(package, "partial-save", 4)
+                self.ledger.set(package, "staged")
+                self.ledger.set(package, "awaiting-human-auth")
 
             outcome = self.driver.save_and_wait(handle)
             if outcome != "success":
@@ -888,7 +1144,7 @@ class Converger:
                 return self._blocked(package, reason, 4)
 
             self.driver.reload(handle)
-            readback = self.driver.inspect(handle, package, self.manifest.publisher)
+            readback = self.driver.inspect(handle, package, publisher, previous)
             if readback.state != "exact":
                 return self._blocked(package, "readback-mismatch", 4)
             self.ledger.set(package, "saved-verified")
@@ -896,7 +1152,7 @@ class Converger:
         for package in self.manifest.packages:
             self.driver.reload(self.handles[package])
             observation = self.driver.inspect(
-                self.handles[package], package, self.manifest.publisher
+                self.handles[package], package, publisher, previous
             )
             if observation.state != "exact":
                 return self._blocked(package, "readback-mismatch", 4)
