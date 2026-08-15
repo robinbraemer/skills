@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Fail-closed npm Trusted Publisher convergence through a restricted page API."""
+"""Fail-closed npm Trusted Publisher convergence through the pinned chrome-devtools-axi CLI."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
 
@@ -30,17 +31,14 @@ LEDGER_STATUSES = {
     "saved-verified",
     "blocked",
 }
-HARNESS_API_KEYS = {
-    "new_tab",
-    "switch_tab",
-    "wait_for_load",
-    "page_identity",
-    "accessibility_tree",
-    "box_model",
-    "reload_page",
-    "click_at_xy",
-    "press_key",
-}
+PINNED_AXI_VERSION = "0.1.29"
+# The only chrome-devtools-axi commands the helper may ever issue. Everything
+# else (eval/run, fill/fillform/type, screenshot, console/network, heap,
+# lighthouse, perf-*, update, ...) is refused before any subprocess is spawned.
+AXI_ALLOWED_COMMANDS = frozenset(
+    {"newpage", "selectpage", "pages", "snapshot", "click", "press", "open"}
+)
+PROVIDER_NAMES = ("GitHub Actions", "GitLab CI/CD", "CircleCI")
 FIELD_LABELS = {
     "owner": "Organization or user",
     "repository": "Repository",
@@ -72,7 +70,11 @@ class HarnessError(RuntimeError):
     """The restricted visible-page interface cannot be used safely."""
 
 
-@dataclass(frozen=True, slots=True)
+class StaleRefError(HarnessError):
+    """An element ref was minted for an older snapshot generation."""
+
+
+@dataclass(frozen=True)
 class Publisher:
     owner: str
     repository: str
@@ -81,13 +83,13 @@ class Publisher:
     allowed_actions: tuple[str, ...]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Manifest:
     packages: tuple[str, ...]
     publisher: Publisher
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Observation:
     state: str
     reason: str | None = None
@@ -317,94 +319,234 @@ class LedgerStore:
                     pass
 
 
-def _ax_value(node: dict[str, Any], key: str) -> Any:
-    value = node.get(key)
-    return value.get("value") if isinstance(value, dict) else None
+@dataclass(frozen=True)
+class AxiResult:
+    """Exit code and stdout of one pinned chrome-devtools-axi invocation."""
+
+    exit_code: int
+    stdout: str
 
 
-def _ax_property(node: dict[str, Any], key: str) -> Any:
-    properties = node.get("properties")
-    if not isinstance(properties, list):
-        return None
-    matches = [
-        item.get("value", {}).get("value")
-        for item in properties
-        if isinstance(item, dict) and item.get("name") == key
-    ]
-    return matches[0] if len(matches) == 1 else None
+@dataclass(frozen=True)
+class AxNode:
+    """One parsed accessibility snapshot line: uid ref, role, name, attributes."""
+
+    uid: str
+    role: str
+    name: str
+    attrs: Mapping[str, Any]
 
 
-class BrowserHarnessDriver:
+def default_axi_script() -> str:
+    """Path of the vendored, pinned chrome-devtools-axi entrypoint."""
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(
+        home,
+        "tools",
+        f"chrome-devtools-axi-{PINNED_AXI_VERSION}",
+        "dist",
+        "bin",
+        "chrome-devtools-axi.js",
+    )
+
+
+class AxiTransport:
+    """Subprocess transport bound to the vendored chrome-devtools-axi release.
+
+    Never resolves the CLI through npx/bunx or a registry; the script path must
+    already exist on disk (the reviewed, pinned install).
+    """
+
+    def __init__(self, script_path: str, bun_path: str = "bun"):
+        script = Path(script_path)
+        if not script.is_file():
+            raise HarnessError("pinned chrome-devtools-axi script is missing")
+        self.script = script
+        self.bun = bun_path
+
+    def run(self, *args: str) -> AxiResult:
+        try:
+            completed = subprocess.run(
+                [self.bun, str(self.script), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise HarnessError("axi invocation failed") from error
+        return AxiResult(exit_code=completed.returncode, stdout=completed.stdout)
+
+
+_NODE_LINE_RE = re.compile(
+    r"^\s*uid=(?P<uid>\S+)\s+(?P<role>[A-Za-z][A-Za-z0-9-]*)(?P<rest>.*)$"
+)
+_ATTRS_ONLY_RE = re.compile(r'(?:\s+[A-Za-z_][A-Za-z0-9_]*(?:="[^"]*")?)*\s*')
+_ATTR_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)(?:="([^"]*)")?')
+_UID_RE = re.compile(r"^g\d+:\S+$")
+_HELP_BLOCK_RE = re.compile(r"^help\[\d+\]:")
+_PAGES_HEADER_RE = re.compile(r"^pages\[\d+\]\{id,url,selected\}:$")
+_PAGES_ROW_RE = re.compile(r"^\s*(\d+),(.*),(true|false)$")
+_PAGES_EMPTY_RE = re.compile(r"^pages: 0 pages open$", re.MULTILINE)
+_STALE_CODE_RE = re.compile(r"^code: STALE_REF$", re.MULTILINE)
+
+
+class AxiDriver:
+    """Drives the npm access page through the restricted AXI command allowlist.
+
+    Element targeting is always role+name against a fresh accessibility
+    snapshot; generation-tagged refs are passed back exactly as printed, and a
+    STALE_REF answer gets exactly one fresh re-snapshot retry before the run
+    fails closed.
+    """
+
     def __init__(
         self,
-        api: Mapping[str, Callable[..., Any]],
+        transport: Any,
         *,
         poll_attempts: int = 600,
         poll_interval: float = 0.5,
         sleeper: Callable[[float], None] = time.sleep,
     ):
-        if set(api) != HARNESS_API_KEYS or any(
-            not callable(api[key]) for key in HARNESS_API_KEYS
-        ):
-            raise HarnessError("browser-harness API keys do not match restricted contract")
+        run = getattr(transport, "run", None)
+        if not callable(run):
+            raise HarnessError("axi transport does not provide a run command")
         if poll_attempts < 1 or poll_interval < 0:
             raise HarnessError("invalid save polling bounds")
-        self.api = dict(api)
+        self.transport = transport
         self.poll_attempts = poll_attempts
         self.poll_interval = poll_interval
         self.sleeper = sleeper
-        self.tabs: list[tuple[Any, str, str]] = []
+        self.tabs: list[tuple[str, str, str]] = []
 
-    def open_package(self, package: str, url: str) -> Any:
-        handle = self.api["new_tab"](url)
-        self.api["wait_for_load"]()
-        self.tabs.append((handle, package, url))
-        return handle
+    # --- restricted CLI boundary ---
 
-    def _activate(self, handle: Any) -> None:
-        self.api["switch_tab"](handle)
-        self.api["wait_for_load"]()
+    def _axi(self, command: str, *args: str) -> str:
+        if command not in AXI_ALLOWED_COMMANDS:
+            raise HarnessError("axi command is not allowlisted")
+        if any(not isinstance(argument, str) for argument in args):
+            raise HarnessError("axi arguments must be strings")
+        result = self.transport.run(command, *args)
+        exit_code = getattr(result, "exit_code", None)
+        stdout = getattr(result, "stdout", None)
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            raise HarnessError("axi transport returned an invalid exit code")
+        if not isinstance(stdout, str):
+            raise HarnessError("axi transport returned invalid output")
+        if exit_code != 0:
+            if _STALE_CODE_RE.search(stdout):
+                raise StaleRefError("axi ref is stale")
+            raise HarnessError("axi command failed")
+        return stdout
 
-    def _tree(self) -> list[dict[str, Any]]:
-        tree = self.api["accessibility_tree"]()
-        if not isinstance(tree, list) or any(not isinstance(node, dict) for node in tree):
-            raise HarnessError("accessibility tree has an invalid shape")
-        return [node for node in tree if not node.get("ignored", False)]
+    # --- snapshot parsing ---
 
     @staticmethod
-    def _matches(
-        tree: list[dict[str, Any]], role: str, name: str
-    ) -> list[dict[str, Any]]:
-        return [
-            node
-            for node in tree
-            if _ax_value(node, "role") == role and _ax_value(node, "name") == name
-        ]
+    def _parse_rest(rest: str) -> tuple[str, dict[str, Any]]:
+        """Split a node line's remainder into accessible name and attributes.
 
-    def _one(
-        self, tree: list[dict[str, Any]], role: str, name: str
-    ) -> dict[str, Any]:
-        matches = self._matches(tree, role, name)
-        if len(matches) != 1:
-            raise HarnessError(f"ambiguous or missing semantic control: {role}/{name}")
-        return matches[0]
+        The upstream formatter renders names unescaped, so a name may itself
+        contain quotes. The closing quote is found by scanning candidates left
+        to right and accepting the first split whose remainder is a pure
+        attribute sequence. Decision-critical bare tokens (checked, disabled,
+        focused) cannot be forged through a name: the formatter's final closing
+        quote always poisons a bare-token injection, and string-valued
+        injections either parse into non-boolean values that fail closed or
+        fall through to the full-name parse.
+        """
 
-    def _form(self, tree: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        controls: dict[str, dict[str, Any]] = {}
-        for field, label in FIELD_LABELS.items():
-            controls[field] = self._one(tree, "textbox", label)
-        for action in SUPPORTED_ACTIONS:
-            controls[action] = self._one(tree, "checkbox", action)
-        controls["save"] = self._one(tree, "button", "Save")
-        for name, control in controls.items():
-            if not isinstance(control.get("backendDOMNodeId"), int):
-                raise HarnessError("semantic control has no backend node")
-            if name != "save" and _ax_property(control, "disabled") is not False:
-                raise HarnessError("semantic control enabled state is not explicit")
-        for action in SUPPORTED_ACTIONS:
-            if not isinstance(_ax_property(controls[action], "checked"), bool):
-                raise HarnessError("allowed-action control has no checked state")
-        return controls
+        def attrs_of(text: str) -> dict[str, Any]:
+            attrs: dict[str, Any] = {}
+            for attr_match in _ATTR_RE.finditer(text):
+                attrs[attr_match.group(1)] = (
+                    attr_match.group(2) if attr_match.group(2) is not None else True
+                )
+            return attrs
+
+        if _ATTRS_ONLY_RE.fullmatch(rest):
+            return "", attrs_of(rest)
+        opening = rest.find('"')
+        if opening == -1 or rest[:opening].strip():
+            raise HarnessError("unparseable snapshot line")
+        for closing in range(opening + 1, len(rest)):
+            if rest[closing] != '"':
+                continue
+            remainder = rest[closing + 1 :]
+            if _ATTRS_ONLY_RE.fullmatch(remainder):
+                return rest[opening + 1 : closing], attrs_of(remainder)
+        raise HarnessError("unparseable snapshot line")
+
+    @classmethod
+    def _parse_node(cls, line: str) -> AxNode:
+        node_match = _NODE_LINE_RE.match(line)
+        if node_match is None:
+            raise HarnessError("unparseable snapshot line")
+        uid = node_match.group("uid")
+        if not _UID_RE.fullmatch(uid):
+            raise HarnessError("snapshot ref has no generation tag")
+        name, attrs = cls._parse_rest(node_match.group("rest"))
+        return AxNode(uid=uid, role=node_match.group("role"), name=name, attrs=attrs)
+
+    def _parse_page(self, stdout: str) -> tuple[str, list[AxNode]]:
+        lines = stdout.splitlines()
+        start = next(
+            (index for index, line in enumerate(lines) if line == "snapshot:"), None
+        )
+        if start is None:
+            raise HarnessError("axi output has no snapshot section")
+        nodes: list[AxNode] = []
+        for line in lines[start + 1 :]:
+            if _HELP_BLOCK_RE.match(line):
+                break
+            if not line.strip():
+                continue
+            if "(truncated," in line:
+                raise HarnessError("snapshot was truncated")
+            nodes.append(self._parse_node(line))
+        if not nodes or nodes[0].role != "RootWebArea":
+            raise HarnessError("snapshot has no root web area")
+        url = nodes[0].attrs.get("url")
+        if not isinstance(url, str):
+            raise HarnessError("snapshot root has no page url")
+        return url, [node for node in nodes if node.role != "ignored"]
+
+    def _page_ids(self) -> list[str]:
+        """List open page IDs.
+
+        Only the ID column is trusted: in the pinned CLI the url column holds a
+        title fragment and the selected flag misparses titled pages, so page
+        identity is always re-proven from the snapshot root URL instead.
+        """
+        stdout = self._axi("pages")
+        lines = stdout.splitlines()
+        start = next(
+            (index for index, line in enumerate(lines) if _PAGES_HEADER_RE.match(line)),
+            None,
+        )
+        if start is None:
+            if _PAGES_EMPTY_RE.search(stdout):
+                return []
+            raise HarnessError("axi pages output has no page table")
+        ids: list[str] = []
+        for line in lines[start + 1 :]:
+            row_match = _PAGES_ROW_RE.match(line)
+            if row_match is None:
+                break
+            ids.append(row_match.group(1))
+        if not ids:
+            raise HarnessError("axi pages output has no rows")
+        return ids
+
+    # --- tab management ---
+
+    def open_package(self, package: str, url: str) -> str:
+        before = set(self._page_ids())
+        self._axi("newpage", url, "--full")
+        added = [page_id for page_id in self._page_ids() if page_id not in before]
+        if len(added) != 1:
+            raise HarnessError("newly opened page is not uniquely identifiable")
+        handle = added[0]
+        self.tabs.append((handle, package, url))
+        return handle
 
     def _expected(self, handle: Any) -> tuple[str, str]:
         matches = [
@@ -416,44 +558,92 @@ class BrowserHarnessDriver:
             raise HarnessError("unknown or ambiguous tab handle")
         return matches[0]
 
-    def _current(
-        self, handle: Any
-    ) -> tuple[str, list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    # --- semantic lookup ---
+
+    @staticmethod
+    def _matches(tree: list[AxNode], role: str, name: str) -> list[AxNode]:
+        return [node for node in tree if node.role == role and node.name == name]
+
+    def _one(self, tree: list[AxNode], role: str, name: str) -> AxNode:
+        matches = self._matches(tree, role, name)
+        if len(matches) != 1:
+            raise HarnessError(f"ambiguous or missing semantic control: {role}/{name}")
+        return matches[0]
+
+    @staticmethod
+    def _value(node: AxNode) -> Any:
+        return node.attrs.get("value")
+
+    @staticmethod
+    def _checked(node: AxNode) -> bool:
+        value = node.attrs.get("checked")
+        if value is True:
+            return True
+        if value is None:
+            return False
+        raise HarnessError("allowed-action control has no boolean checked state")
+
+    def _form(self, tree: list[AxNode]) -> dict[str, AxNode]:
+        controls: dict[str, AxNode] = {}
+        for field, label in FIELD_LABELS.items():
+            controls[field] = self._one(tree, "textbox", label)
+        for action in SUPPORTED_ACTIONS:
+            controls[action] = self._one(tree, "checkbox", action)
+        controls["save"] = self._one(tree, "button", "Save")
+        for name, control in controls.items():
+            if name != "save" and "disabled" in control.attrs:
+                raise HarnessError("semantic control is disabled")
+        for action in SUPPORTED_ACTIONS:
+            self._checked(controls[action])
+        return controls
+
+    def _verify_identity(self, handle: Any, url: str, tree: list[AxNode]) -> None:
         package, expected_url = self._expected(handle)
-        self._activate(handle)
-        identity = self.api["page_identity"]()
-        if not isinstance(identity, dict) or identity.get("url") != expected_url:
+        if url != expected_url:
             raise HarnessError("package page identity changed")
-        tree = self._tree()
         if len(self._matches(tree, "heading", package)) != 1:
             raise HarnessError("visible package identity changed")
         if len(self._matches(tree, "heading", "Trusted publishing")) != 1:
             raise HarnessError("Trusted publishing section changed")
+
+    def _current(self, handle: Any) -> tuple[str, list[AxNode], dict[str, AxNode]]:
+        package, _ = self._expected(handle)
+        url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
+        self._verify_identity(handle, url, tree)
         return package, tree, self._form(tree)
 
-    def _center(self, node: dict[str, Any]) -> tuple[float, float]:
-        model = self.api["box_model"](node["backendDOMNodeId"])
-        content = model.get("content") if isinstance(model, dict) else None
-        if (
-            not isinstance(content, list)
-            or len(content) != 8
-            or any(not isinstance(value, (int, float)) for value in content)
-        ):
-            raise HarnessError("semantic control has no current box geometry")
-        return (
-            sum(content[index] for index in (0, 2, 4, 6)) / 4,
-            sum(content[index] for index in (1, 3, 5, 7)) / 4,
-        )
+    # --- interaction primitives ---
 
-    def inspect(
-        self, handle: Any, package: str, publisher: Publisher
-    ) -> Observation:
+    def _click_control(
+        self, handle: Any, tree: list[AxNode], role: str, name: str
+    ) -> tuple[str, list[AxNode]]:
+        node = self._one(tree, role, name)
         try:
-            self._activate(handle)
-            identity = self.api["page_identity"]()
-            if not isinstance(identity, dict) or identity.get("url") != package_url(package):
+            stdout = self._axi("click", f"@{node.uid}", "--full")
+        except StaleRefError:
+            url, fresh = self._parse_page(self._axi("snapshot", "--full"))
+            self._verify_identity(handle, url, fresh)
+            node = self._one(fresh, role, name)
+            try:
+                stdout = self._axi("click", f"@{node.uid}", "--full")
+            except StaleRefError as error:
+                raise HarnessError(
+                    "element reference stayed stale after one refresh"
+                ) from error
+        return self._parse_page(stdout)
+
+    def _press(self, key: str) -> tuple[str, list[AxNode]]:
+        if len(key) != 1 or ord(key) < 32 or ord(key) == 127:
+            raise HarnessError("only single printable characters may be pressed")
+        return self._parse_page(self._axi("press", key, "--full"))
+
+    # --- driver surface used by the converger ---
+
+    def inspect(self, handle: Any, package: str, publisher: Publisher) -> Observation:
+        try:
+            url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
+            if url != package_url(package):
                 return Observation("blocked", "identity-mismatch")
-            tree = self._tree()
             if len(self._matches(tree, "heading", package)) != 1:
                 return Observation("blocked", "identity-mismatch")
             if len(self._matches(tree, "heading", "Trusted publishing")) != 1:
@@ -461,36 +651,27 @@ class BrowserHarnessDriver:
             try:
                 controls = self._form(tree)
             except HarnessError:
-                provider_names = ("GitHub Actions", "GitLab CI/CD", "CircleCI")
                 providers = {
-                    name: self._one(tree, "button", name) for name in provider_names
+                    name: self._one(tree, "button", name) for name in PROVIDER_NAMES
                 }
-                if any(
-                    not isinstance(node.get("backendDOMNodeId"), int)
-                    or _ax_property(node, "disabled") is not False
-                    for node in providers.values()
-                ):
+                if any("disabled" in node.attrs for node in providers.values()):
                     raise HarnessError("provider selection is unavailable")
-                self.api["click_at_xy"](*self._center(providers["GitHub Actions"]))
-                self.api["wait_for_load"]()
-                tree = self._tree()
-                if len(self._matches(tree, "heading", package)) != 1 or len(
-                    self._matches(tree, "heading", "Trusted publishing")
-                ) != 1:
+                url, tree = self._click_control(handle, tree, "button", "GitHub Actions")
+                if url != package_url(package) or len(
+                    self._matches(tree, "heading", package)
+                ) != 1 or len(self._matches(tree, "heading", "Trusted publishing")) != 1:
                     raise HarnessError("provider form changed package identity")
                 controls = self._form(tree)
         except HarnessError:
             return Observation("blocked", "ui-drift")
 
-        values = {
-            field: _ax_value(controls[field], "value") for field in FIELD_LABELS
-        }
+        values = {field: self._value(controls[field]) for field in FIELD_LABELS}
         if any(not isinstance(value, str) for value in values.values()):
             return Observation("blocked", "ui-drift")
         checked = {
             action
             for action in SUPPORTED_ACTIONS
-            if _ax_property(controls[action], "checked") is True
+            if self._checked(controls[action]) is True
         }
         if all(value == "" for value in values.values()) and not checked:
             return Observation("absent")
@@ -512,77 +693,75 @@ class BrowserHarnessDriver:
             "environment": publisher.environment or "",
         }
         for field, desired in desired_values.items():
-            _, _, controls = self._current(handle)
-            node = controls[field]
-            if _ax_value(node, "value") != "":
+            _, tree, controls = self._current(handle)
+            if self._value(controls[field]) != "":
                 raise HarnessError("textbox is not empty before staging")
             if desired == "":
                 continue
-            self.api["click_at_xy"](*self._center(node))
-            _, _, controls = self._current(handle)
+            url, tree = self._click_control(
+                handle, tree, "textbox", FIELD_LABELS[field]
+            )
+            self._verify_identity(handle, url, tree)
+            controls = self._form(tree)
             node = controls[field]
-            if _ax_property(node, "focused") is not True:
+            if node.attrs.get("focused") is not True:
                 raise HarnessError("textbox did not receive visible focus")
-            if _ax_value(node, "value") != "":
+            if self._value(node) != "":
                 raise HarnessError("textbox changed before keyboard input")
             prefix = ""
             for character in desired:
-                self.api["press_key"](character)
+                url, tree = self._press(character)
                 prefix += character
-                _, _, controls = self._current(handle)
+                self._verify_identity(handle, url, tree)
+                controls = self._form(tree)
                 node = controls[field]
-                if _ax_property(node, "focused") is not True:
+                if node.attrs.get("focused") is not True:
                     raise HarnessError("textbox lost focus during keyboard input")
-                if _ax_value(node, "value") != prefix:
+                if self._value(node) != prefix:
                     raise HarnessError("textbox prefix read-back mismatch")
 
         desired_actions = set(publisher.allowed_actions)
         for action in SUPPORTED_ACTIONS:
-            _, _, controls = self._current(handle)
-            checked = _ax_property(controls[action], "checked")
-            should_check = action in desired_actions
-            if checked is not False:
+            _, tree, controls = self._current(handle)
+            if self._checked(controls[action]) is not False:
                 raise HarnessError("allowed-action form was not initially empty")
-            if should_check:
-                self.api["click_at_xy"](*self._center(controls[action]))
-                _, _, refreshed = self._current(handle)
-                if _ax_property(refreshed[action], "checked") is not True:
+            if action in desired_actions:
+                url, tree = self._click_control(handle, tree, "checkbox", action)
+                self._verify_identity(handle, url, tree)
+                refreshed = self._form(tree)
+                if self._checked(refreshed[action]) is not True:
                     raise HarnessError("allowed-action read-back mismatch")
 
         _, _, controls = self._current(handle)
-        final_values = {
-            field: _ax_value(controls[field], "value") for field in FIELD_LABELS
-        }
+        final_values = {field: self._value(controls[field]) for field in FIELD_LABELS}
         final_actions = {
             action
             for action in SUPPORTED_ACTIONS
-            if _ax_property(controls[action], "checked") is True
+            if self._checked(controls[action]) is True
         }
         if final_values != desired_values or final_actions != desired_actions:
             raise HarnessError("staged form read-back mismatch")
 
     @staticmethod
-    def _messages(tree: list[dict[str, Any]]) -> Counter[tuple[str, str]]:
+    def _messages(tree: list[AxNode]) -> Counter:
         return Counter(
-            (_ax_value(node, "role"), str(_ax_value(node, "name") or ""))
+            (node.role, node.name)
             for node in tree
-            if _ax_value(node, "role") in {"alert", "status"}
+            if node.role in {"alert", "status"}
         )
 
     def save_and_wait(self, handle: Any) -> str:
         _, tree, controls = self._current(handle)
         save = controls["save"]
-        if _ax_property(save, "disabled") is not False:
+        if "disabled" in save.attrs:
             return "save-failed"
         baseline_messages = self._messages(tree)
-        self.api["click_at_xy"](*self._center(save))
+        url, tree = self._click_control(handle, tree, "button", "Save")
 
         for attempt in range(self.poll_attempts):
             package, expected_url = self._expected(handle)
-            identity = self.api["page_identity"]()
-            if not isinstance(identity, dict) or identity.get("url") != expected_url:
+            if url != expected_url:
                 return "save-failed"
-            tree = self._tree()
             if len(self._matches(tree, "heading", package)) != 1:
                 return "save-failed"
             messages = self._messages(tree) - baseline_messages
@@ -645,12 +824,13 @@ class BrowserHarnessDriver:
                     return "success"
             if attempt + 1 < self.poll_attempts:
                 self.sleeper(self.poll_interval)
+                url, tree = self._parse_page(self._axi("snapshot", "--full"))
         return "authentication-ambiguous"
 
     def reload(self, handle: Any) -> None:
         self._current(handle)
-        self.api["reload_page"]()
-        self.api["wait_for_load"]()
+        _, expected_url = self._expected(handle)
+        self._axi("open", expected_url, "--full")
 
 
 class Converger:
@@ -730,12 +910,7 @@ def _print_ledger(manifest: Manifest, ledger: LedgerStore) -> None:
         print(f"{package}: {record['status']}{suffix}")
 
 
-def run_browser_harness(
-    *,
-    manifest_path: str,
-    ledger_path: str,
-    api: Mapping[str, Callable[..., Any]],
-) -> int:
+def run_axi(*, manifest_path: str, ledger_path: str, transport: Any) -> int:
     try:
         manifest = load_manifest(manifest_path)
         ledger = LedgerStore(ledger_path, manifest)
@@ -744,7 +919,7 @@ def run_browser_harness(
         return 2
 
     try:
-        driver = BrowserHarnessDriver(api)
+        driver = AxiDriver(transport)
         code = Converger(manifest, ledger, driver).run()
     except Exception:
         package = next(
@@ -764,3 +939,36 @@ def run_browser_harness(
 
     _print_ledger(manifest, ledger)
     return code
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Converge npm Trusted Publishers through the pinned chrome-devtools-axi CLI."
+    )
+    parser.add_argument("--manifest", required=True, help="user-approved manifest JSON path")
+    parser.add_argument("--ledger", required=True, help="local resume ledger path")
+    parser.add_argument(
+        "--axi-script",
+        default=None,
+        help="pinned chrome-devtools-axi.js path (default: vendored install)",
+    )
+    parser.add_argument("--bun", default="bun", help="bun executable used to run the pinned CLI")
+    arguments = parser.parse_args(argv)
+
+    try:
+        transport = AxiTransport(
+            arguments.axi_script or default_axi_script(), bun_path=arguments.bun
+        )
+    except HarnessError:
+        print("blocked: pinned chrome-devtools-axi runtime is unavailable")
+        return 5
+
+    return run_axi(
+        manifest_path=arguments.manifest,
+        ledger_path=arguments.ledger,
+        transport=transport,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

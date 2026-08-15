@@ -244,416 +244,423 @@ class ConvergerPreflightTests(unittest.TestCase):
         self.assertFalse(any(call[0] in {"stage", "save"} for call in driver.calls))
 
 
-def ax_node(role, name, *, value=None, backend=None, **properties):
-    node = {
-        "role": {"value": role},
-        "name": {"value": name},
-        "properties": [
-            {"name": key, "value": {"value": prop_value}}
-            for key, prop_value in properties.items()
-        ],
-    }
-    if value is not None:
-        node["value"] = {"value": value}
-    if backend is not None:
-        node["backendDOMNodeId"] = backend
-    return node
+PACKAGE_URL = "https://www.npmjs.com/package/@example/widgets/access"
+FIELD_LABELS = (
+    "Organization or user",
+    "Repository",
+    "Workflow filename",
+    "Environment name (optional)",
+)
+FIELD_IDS = {
+    "Organization or user": "1_10",
+    "Repository": "1_11",
+    "Workflow filename": "1_12",
+    "Environment name (optional)": "1_13",
+}
+ACTION_IDS = {"npm publish": "1_20", "npm stage publish": "1_21"}
+SAVE_ID = "1_30"
+PROVIDER_IDS = {"GitHub Actions": "1_40", "GitLab CI/CD": "1_41", "CircleCI": "1_42"}
 
 
-def form_tree(package="@example/widgets", values=None, checked=("npm publish",)):
-    values = values or {
-        "Organization or user": "example-org",
-        "Repository": "widgets",
-        "Workflow filename": "release.yml",
-        "Environment name (optional)": "",
-    }
-    nodes = [
-        ax_node("heading", package),
-        ax_node("heading", "Trusted publishing"),
-    ]
-    backend = 10
-    for label, value in values.items():
-        nodes.append(
-            ax_node(
-                "textbox",
-                label,
-                value=value,
-                backend=backend,
-                focused=False,
-                disabled=False,
-            )
-        )
-        backend += 1
-    for action in ("npm publish", "npm stage publish"):
-        nodes.append(
-            ax_node(
-                "checkbox",
-                action,
-                backend=backend,
-                checked=action in checked,
-                disabled=False,
-            )
-        )
-        backend += 1
-    nodes.append(ax_node("button", "Save", backend=backend, disabled=False))
-    return nodes
+class FakeAxiTransport:
+    """In-memory double of the pinned chrome-devtools-axi CLI for one npm page.
 
-
-class StaticBrowserApi:
-    def __init__(self, tree=None, identity=None):
-        self.tree = tree or form_tree()
-        self.identity = identity or {
-            "url": "https://www.npmjs.com/package/@example/widgets/access",
-            "title": "Package access",
-        }
-        self.calls = []
-        self.handle = object()
-
-    def mapping(self):
-        return {
-            "new_tab": self.new_tab,
-            "switch_tab": self.switch_tab,
-            "wait_for_load": self.wait_for_load,
-            "page_identity": self.page_identity,
-            "accessibility_tree": self.accessibility_tree,
-            "box_model": self.box_model,
-            "reload_page": self.reload_page,
-            "click_at_xy": self.click_at_xy,
-            "press_key": self.press_key,
-        }
-
-    def new_tab(self, url):
-        self.calls.append(("new_tab", url))
-        return self.handle
-
-    def switch_tab(self, handle):
-        self.calls.append(("switch_tab", handle))
-
-    def wait_for_load(self):
-        self.calls.append(("wait_for_load",))
-
-    def page_identity(self):
-        return dict(self.identity)
-
-    def accessibility_tree(self):
-        return list(self.tree)
-
-    def box_model(self, node):
-        return {"content": [0, 0, 10, 0, 10, 10, 0, 10]}
-
-    def reload_page(self):
-        self.calls.append(("reload_page",))
-
-    def click_at_xy(self, x, y):
-        self.calls.append(("click_at_xy", x, y))
-
-    def press_key(self, key, modifiers=0):
-        self.calls.append(("press_key", key, modifiers))
-
-
-class InteractiveBrowserApi(StaticBrowserApi):
-    FIELD_BACKENDS = {
-        "Organization or user": 10,
-        "Repository": 11,
-        "Workflow filename": 12,
-        "Environment name (optional)": 13,
-    }
-    ACTION_BACKENDS = {"npm publish": 20, "npm stage publish": 21}
-    SAVE_BACKEND = 30
+    Renders real-format output: TOON page/error blocks, `snapshot:` sections
+    with generation-stamped `uid=g<N>:<id>` refs, `pages[...]` tables, and
+    STALE_REF errors when a ref's generation is no longer current.
+    """
 
     def __init__(
         self,
         *,
+        url=PACKAGE_URL,
+        package_heading="@example/widgets",
+        section_heading="Trusted publishing",
+        values=None,
+        checked=(),
         save_result="success",
         corrupt_prefix=False,
         save_disabled=False,
         stale_success=False,
         auth_status_message=None,
+        provider_choice=False,
+        stale_clicks=0,
+        garbage_selectpage=False,
+        missing_field=None,
+        duplicate_field=None,
+        disabled_field=None,
     ):
-        super().__init__(tree=[])
-        self.values = {label: "" for label in self.FIELD_BACKENDS}
-        self.checked = set()
+        self.url = url
+        self.package_heading = package_heading
+        self.section_heading = section_heading
+        self.values = {label: "" for label in FIELD_LABELS}
+        if values:
+            self.values.update(values)
+        self.checked = set(checked)
         self.focused = None
         self.save_result = save_result
         self.corrupt_prefix = corrupt_prefix
         self.save_disabled = save_disabled
         self.stale_success = stale_success
         self.auth_status_message = auth_status_message
+        self.provider_choice = provider_choice
+        self.stale_clicks_remaining = stale_clicks
+        self.garbage_selectpage = garbage_selectpage
+        self.missing_field = missing_field
+        self.duplicate_field = duplicate_field
+        self.disabled_field = disabled_field
         self.save_clicked = False
+        self.generation = 0
+        self.pages = {"0": "about:blank"}
+        self.selected = "0"
+        self.next_page_id = 1
+        self.calls = []
 
-    def accessibility_tree(self):
-        nodes = [
-            ax_node("heading", "@example/widgets"),
-            ax_node("heading", "Trusted publishing"),
-        ]
-        for label, backend in self.FIELD_BACKENDS.items():
-            nodes.append(
-                ax_node(
-                    "textbox",
-                    label,
-                    value=self.values[label],
-                    backend=backend,
-                    focused=self.focused == label,
-                    disabled=False,
-                )
-            )
-        for action, backend in self.ACTION_BACKENDS.items():
-            nodes.append(
-                ax_node(
-                    "checkbox",
-                    action,
-                    backend=backend,
-                    checked=action in self.checked,
-                    disabled=False,
-                )
-            )
-        nodes.append(
-            ax_node(
-                "button",
-                "Save",
-                backend=self.SAVE_BACKEND,
-                disabled=self.save_disabled,
-            )
-        )
-        if self.save_clicked and self.auth_status_message is not None:
-            nodes.extend(
-                [
-                    ax_node("status", "Trusted publisher saved successfully"),
-                    ax_node("status", self.auth_status_message),
-                ]
-            )
-        elif self.save_clicked and self.save_result in {
-            "positive-then-negative",
-            "negative-then-positive",
-            "status-auth-negative",
-        }:
-            positive = ax_node("status", "Trusted publisher saved successfully")
-            negative = ax_node(
-                "status" if self.save_result == "status-auth-negative" else "alert",
-                "Authentication canceled",
-            )
-            nodes.extend(
-                [positive, negative]
-                if self.save_result in {"positive-then-negative", "status-auth-negative"}
-                else [negative, positive]
-            )
-        elif self.stale_success or (self.save_clicked and self.save_result == "success"):
-            nodes.append(ax_node("status", "Trusted publisher saved successfully"))
-        elif self.save_clicked and self.save_result == "authentication-failed":
-            nodes.append(ax_node("alert", "Authentication canceled"))
-        elif self.save_clicked and self.save_result == "save-failed":
-            nodes.append(ax_node("alert", "Trusted publisher save failed"))
-        elif self.save_clicked and self.save_result == "negative-success":
-            nodes.append(ax_node("status", "Trusted publisher save unsuccessful"))
-        return nodes
+    # --- CLI dispatch ---
 
-    def box_model(self, node):
-        left = node * 10
-        return {
-            "content": [left, 0, left + 8, 0, left + 8, 8, left, 8]
-        }
+    def run(self, *args):
+        self.calls.append(tuple(args))
+        command = args[0]
+        if command == "newpage":
+            page_id = str(self.next_page_id)
+            self.next_page_id += 1
+            self.pages[page_id] = args[1]
+            self.selected = page_id
+            return self._page_output()
+        if command == "pages":
+            # Mirror the pinned CLI's real output: the url column carries a
+            # title fragment and the selected flag misparses to false, so any
+            # driver reliance on those columns fails these tests.
+            rows = [f"  {page_id},npm,false" for page_id in self.pages]
+            body = "\n".join(
+                [f"pages[{len(rows)}]{{id,url,selected}}:", *rows, "help[1]:",
+                 "  Run `chrome-devtools-axi selectpage <id>` to switch tabs"]
+            )
+            return MODULE.AxiResult(0, body + "\n")
+        if command == "selectpage":
+            if args[1] not in self.pages:
+                return self._error("No page with ID " + args[1], "VALIDATION_ERROR", 2)
+            self.selected = args[1]
+            if self.garbage_selectpage:
+                return MODULE.AxiResult(0, "page:\n  refs: 0\nnonsense without a tree\n")
+            return self._page_output()
+        if command == "snapshot":
+            return self._page_output()
+        if command == "open":
+            self.pages[self.selected] = args[1]
+            self.focused = None
+            self.save_clicked = False
+            return self._page_output()
+        if command == "click":
+            return self._click(args[1])
+        if command == "press":
+            self._press(args[1])
+            return self._page_output()
+        return self._error(f"Unknown command: {command}", "VALIDATION_ERROR", 2)
 
-    def click_at_xy(self, x, y):
-        super().click_at_xy(x, y)
-        backend = int(x // 10)
-        for label, candidate in self.FIELD_BACKENDS.items():
-            if backend == candidate:
+    # --- interaction semantics ---
+
+    def _click(self, ref):
+        if self.stale_clicks_remaining > 0:
+            self.stale_clicks_remaining -= 1
+            return self._stale_error(ref)
+        stripped = ref[1:] if ref.startswith("@") else ref
+        generation, _, node_id = stripped.partition(":")
+        if generation != f"g{self.generation}":
+            return self._stale_error(ref)
+        for label, candidate in FIELD_IDS.items():
+            if node_id == candidate:
                 self.focused = label
-                return
-        for action, candidate in self.ACTION_BACKENDS.items():
-            if backend == candidate:
-                if action in self.checked:
-                    self.checked.remove(action)
-                else:
-                    self.checked.add(action)
-                return
-        if backend == self.SAVE_BACKEND and not self.save_disabled:
+                return self._page_output()
+        for action, candidate in ACTION_IDS.items():
+            if node_id == candidate:
+                self.checked.symmetric_difference_update({action})
+                return self._page_output()
+        if node_id == SAVE_ID and not self.save_disabled:
             self.save_clicked = True
+            return self._page_output()
+        if node_id == PROVIDER_IDS["GitHub Actions"] and self.provider_choice:
+            self.provider_choice = False
+            return self._page_output()
+        return self._page_output()
 
-    def press_key(self, key, modifiers=0):
-        super().press_key(key, modifiers)
-        if self.focused is None or modifiers != 0 or len(key) != 1:
+    def _press(self, key):
+        if self.focused is None or len(key) != 1:
             return
         value = self.values[self.focused] + key
         if self.corrupt_prefix and not self.values[self.focused]:
             value = "!"
         self.values[self.focused] = value
 
+    # --- output rendering ---
 
-class BrowserHarnessAdapterContractTests(unittest.TestCase):
-    def test_adapter_opens_unique_github_provider_form_before_classifying_absent(self):
-        fake = InteractiveBrowserApi()
-        choice_tree = [
-            ax_node("heading", "@example/widgets"),
-            ax_node("heading", "Trusted publishing"),
-            ax_node("button", "GitHub Actions", backend=40, disabled=False),
-            ax_node("button", "GitLab CI/CD", backend=41, disabled=False),
-            ax_node("button", "CircleCI", backend=42, disabled=False),
-        ]
-        original_tree = fake.accessibility_tree
-        choosing = {"value": True}
+    def _error(self, message, code, exit_code=1):
+        return MODULE.AxiResult(exit_code, f'error: "{message}"\ncode: {code}\n')
 
-        def tree():
-            return choice_tree if choosing["value"] else original_tree()
-
-        def click(x, y):
-            if int(x // 10) == 40:
-                choosing["value"] = False
-            InteractiveBrowserApi.click_at_xy(fake, x, y)
-
-        api = fake.mapping()
-        api["accessibility_tree"] = tree
-        api["click_at_xy"] = click
-        driver = MODULE.BrowserHarnessDriver(api)
-        handle = driver.open_package(
-            "@example/widgets",
-            "https://www.npmjs.com/package/@example/widgets/access",
+    def _stale_error(self, ref):
+        return MODULE.AxiResult(
+            1,
+            f'error: "Stale ref {ref}: from an older snapshot generation. '
+            'Re-snapshot to get fresh refs."\n'
+            "code: STALE_REF\n"
+            "help[1]:\n"
+            "  Run `chrome-devtools-axi snapshot` to get fresh refs\n",
         )
+
+    def _uid(self, node_id):
+        return f"uid=g{self.generation}:{node_id}"
+
+    def _tree_lines(self):
+        lines = [
+            f'{self._uid("1_0")} RootWebArea "npm" url="{self.url}" focusable focused'
+        ]
+        if self.package_heading is not None:
+            lines.append(f'  {self._uid("1_1")} heading "{self.package_heading}" level="1"')
+        if self.section_heading is not None:
+            lines.append(f'  {self._uid("1_2")} heading "{self.section_heading}" level="2"')
+        if self.provider_choice:
+            for name, node_id in PROVIDER_IDS.items():
+                lines.append(f'  {self._uid(node_id)} button "{name}"')
+            return lines
+        for label in FIELD_LABELS:
+            if label == self.missing_field:
+                continue
+            focused = " focused" if self.focused == label else ""
+            disabled = " disabled" if label == self.disabled_field else ""
+            lines.append(
+                f'  {self._uid(FIELD_IDS[label])} textbox "{label}" '
+                f'value="{self.values[label]}" focusable{focused}{disabled}'
+            )
+            if label == self.duplicate_field:
+                lines.append(
+                    f'  {self._uid("1_99")} textbox "{label}" '
+                    f'value="{self.values[label]}" focusable'
+                )
+        for action in ("npm publish", "npm stage publish"):
+            checked = " checked" if action in self.checked else ""
+            lines.append(f'  {self._uid(ACTION_IDS[action])} checkbox "{action}"{checked}')
+        save_state = " disableable disabled" if self.save_disabled else ""
+        lines.append(f'  {self._uid(SAVE_ID)} button "Save"{save_state}')
+        lines.extend(self._message_lines())
+        return lines
+
+    def _message_lines(self):
+        nodes = []
+        if self.save_clicked and self.auth_status_message is not None:
+            nodes = [
+                ("status", "Trusted publisher saved successfully"),
+                ("status", self.auth_status_message),
+            ]
+        elif self.save_clicked and self.save_result in {
+            "positive-then-negative",
+            "negative-then-positive",
+            "status-auth-negative",
+        }:
+            positive = ("status", "Trusted publisher saved successfully")
+            negative = (
+                "status" if self.save_result == "status-auth-negative" else "alert",
+                "Authentication canceled",
+            )
+            nodes = (
+                [positive, negative]
+                if self.save_result in {"positive-then-negative", "status-auth-negative"}
+                else [negative, positive]
+            )
+        elif self.stale_success or (self.save_clicked and self.save_result == "success"):
+            nodes = [("status", "Trusted publisher saved successfully")]
+        elif self.save_clicked and self.save_result == "authentication-failed":
+            nodes = [("alert", "Authentication canceled")]
+        elif self.save_clicked and self.save_result == "save-failed":
+            nodes = [("alert", "Trusted publisher save failed")]
+        elif self.save_clicked and self.save_result == "negative-success":
+            nodes = [("status", "Trusted publisher save unsuccessful")]
+        return [
+            f'  {self._uid(f"1_5{index}")} {role} "{message}"'
+            for index, (role, message) in enumerate(nodes)
+        ]
+
+    def _page_output(self):
+        self.generation += 1
+        tree = self._tree_lines()
+        body = "\n".join(
+            [
+                "page:",
+                '  title: "npm"',
+                f"  refs: {len(tree)}",
+                "snapshot:",
+                *tree,
+                "help[1]:",
+                "  Run `chrome-devtools-axi snapshot` to re-orient",
+            ]
+        )
+        return MODULE.AxiResult(0, body + "\n")
+
+
+class RaisingTransport:
+    def run(self, *args):
+        raise RuntimeError("sensitive browser detail")
+
+
+def make_driver(transport, poll_attempts=1):
+    return MODULE.AxiDriver(
+        transport, poll_attempts=poll_attempts, sleeper=lambda _: None
+    )
+
+
+def open_widget(driver):
+    return driver.open_package("@example/widgets", PACKAGE_URL)
+
+
+class AxiAdapterContractTests(unittest.TestCase):
+    def test_adapter_opens_unique_github_provider_form_before_classifying_absent(self):
+        fake = FakeAxiTransport(provider_choice=True)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
 
         observation = driver.inspect(
             handle, "@example/widgets", model_manifest().publisher
         )
 
         self.assertEqual(observation, MODULE.Observation("absent"))
-        self.assertFalse(choosing["value"])
+        self.assertFalse(fake.provider_choice)
 
-    def test_adapter_rejects_missing_or_extra_api(self):
-        api = StaticBrowserApi().mapping()
-        for candidate in ({key: value for key, value in api.items() if key != "press_key"},
-                          {**api, "type_text": lambda text: None}):
-            with self.subTest(keys=sorted(candidate)):
-                with self.assertRaisesRegex(MODULE.HarnessError, "API keys"):
-                    MODULE.BrowserHarnessDriver(candidate)
+    def test_adapter_rejects_transport_without_run_command(self):
+        with self.assertRaisesRegex(MODULE.HarnessError, "run command"):
+            MODULE.AxiDriver(object())
 
-    def test_adapter_uses_opaque_tab_handles_without_logging(self):
-        fake = StaticBrowserApi()
-        driver = MODULE.BrowserHarnessDriver(fake.mapping())
+    def test_adapter_refuses_non_allowlisted_commands(self):
+        driver = make_driver(FakeAxiTransport())
+        for forbidden in (
+            ("eval", "document.title"),
+            ("fill", "@g1:1_10", "example-org"),
+            ("fillform", "@g1:1_10=example-org"),
+            ("type", "example-org"),
+            ("screenshot", "page.png"),
+            ("network",),
+            ("console",),
+            ("update",),
+        ):
+            with self.subTest(command=forbidden[0]):
+                with self.assertRaisesRegex(MODULE.HarnessError, "allowlisted"):
+                    driver._axi(*forbidden)
 
-        handle = driver.open_package(
-            "@example/widgets",
-            "https://www.npmjs.com/package/@example/widgets/access",
-        )
+    def test_full_run_only_issues_allowlisted_commands(self):
+        fake = FakeAxiTransport()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(json.dumps(valid_manifest()), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = MODULE.run_axi(
+                    manifest_path=str(manifest),
+                    ledger_path=str(Path(directory) / "ledger.json"),
+                    transport=fake,
+                )
 
-        self.assertIs(handle, fake.handle)
-        self.assertEqual(fake.calls[0][0], "new_tab")
+        self.assertEqual(code, 0)
+        issued = {call[0] for call in fake.calls}
+        self.assertLessEqual(issued, set(MODULE.AXI_ALLOWED_COMMANDS))
+        self.assertFalse(issued & {"eval", "run", "fill", "fillform", "type"})
+
+    def test_adapter_uses_page_ids_as_opaque_handles(self):
+        fake = FakeAxiTransport()
+        driver = make_driver(fake)
+
+        handle = open_widget(driver)
+
+        self.assertEqual(handle, "1")
+        self.assertEqual(fake.calls[0], ("pages",))
+        self.assertEqual(fake.calls[1], ("newpage", PACKAGE_URL, "--full"))
 
     def test_adapter_rejects_wrong_origin_path_or_package_identity(self):
-        identities = (
-            {
-                "url": "https://example.invalid/package/@example/widgets/access",
-                "title": "Package access",
-            },
-            {
-                "url": "https://www.npmjs.com/package/@example/icons/access",
-                "title": "Package access",
-            },
-        )
-        for identity in identities:
-            with self.subTest(url=identity["url"]):
-                fake = StaticBrowserApi(identity=identity)
-                driver = MODULE.BrowserHarnessDriver(fake.mapping())
+        for url in (
+            "https://example.invalid/package/@example/widgets/access",
+            "https://www.npmjs.com/package/@example/icons/access",
+        ):
+            with self.subTest(url=url):
+                fake = FakeAxiTransport(url=url)
+                driver = make_driver(fake)
+                handle = open_widget(driver)
                 observation = driver.inspect(
-                    fake.handle, "@example/widgets", model_manifest().publisher
+                    handle, "@example/widgets", model_manifest().publisher
                 )
                 self.assertEqual(
                     observation,
                     MODULE.Observation("blocked", "identity-mismatch"),
                 )
 
-        fake = StaticBrowserApi(
-            tree=[node for node in form_tree() if node["name"]["value"] != "@example/widgets"]
-        )
-        observation = MODULE.BrowserHarnessDriver(fake.mapping()).inspect(
-            fake.handle, "@example/widgets", model_manifest().publisher
+        fake = FakeAxiTransport(package_heading=None)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+        observation = driver.inspect(
+            handle, "@example/widgets", model_manifest().publisher
         )
         self.assertEqual(observation.reason, "identity-mismatch")
 
-    def test_adapter_rejects_ambiguous_or_missing_semantic_controls(self):
-        missing = [
-            node
-            for node in form_tree()
-            if node["name"]["value"] != "Workflow filename"
-        ]
-        duplicate = form_tree() + [
-            ax_node(
-                "textbox",
-                "Repository",
-                value="widgets",
-                backend=99,
-                focused=False,
-                disabled=False,
-            )
-        ]
-        missing_enabled_state = form_tree()
-        missing_enabled_state[2]["properties"] = [
-            prop
-            for prop in missing_enabled_state[2]["properties"]
-            if prop["name"] != "disabled"
-        ]
-        for tree in (missing, duplicate, missing_enabled_state):
-            with self.subTest(size=len(tree)):
-                fake = StaticBrowserApi(tree=tree)
-                observation = MODULE.BrowserHarnessDriver(fake.mapping()).inspect(
-                    fake.handle, "@example/widgets", model_manifest().publisher
+    def test_adapter_rejects_ambiguous_missing_or_disabled_semantic_controls(self):
+        variants = (
+            {"missing_field": "Workflow filename"},
+            {"duplicate_field": "Repository"},
+            {"disabled_field": "Organization or user"},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                fake = FakeAxiTransport(**variant)
+                driver = make_driver(fake)
+                handle = open_widget(driver)
+                observation = driver.inspect(
+                    handle, "@example/widgets", model_manifest().publisher
                 )
                 self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
 
 
-class BrowserHarnessInteractionTests(unittest.TestCase):
-    def driver_for(self, fake, poll_attempts=1):
-        driver = MODULE.BrowserHarnessDriver(
-            fake.mapping(), poll_attempts=poll_attempts, sleeper=lambda _: None
-        )
-        driver.open_package(
-            "@example/widgets",
-            "https://www.npmjs.com/package/@example/widgets/access",
-        )
-        return driver
+class AxiInteractionTests(unittest.TestCase):
+    def staged_driver(self, fake, poll_attempts=1):
+        driver = make_driver(fake, poll_attempts=poll_attempts)
+        handle = open_widget(driver)
+        return driver, handle
 
-    def test_text_entry_uses_press_key_per_character_with_prefix_readback(self):
-        fake = InteractiveBrowserApi()
-        driver = self.driver_for(fake)
+    def test_text_entry_uses_press_per_character_with_prefix_readback(self):
+        fake = FakeAxiTransport()
+        driver, handle = self.staged_driver(fake)
 
-        driver.stage(fake.handle, model_manifest().publisher)
+        driver.stage(handle, model_manifest().publisher)
 
-        typed = "".join(
-            call[1] for call in fake.calls if call[0] == "press_key"
-        )
+        typed = "".join(call[1] for call in fake.calls if call[0] == "press")
         self.assertEqual(typed, "example-orgwidgetsrelease.yml")
         self.assertEqual(fake.values["Organization or user"], "example-org")
         self.assertEqual(fake.values["Repository"], "widgets")
         self.assertEqual(fake.values["Workflow filename"], "release.yml")
 
     def test_text_entry_stops_on_prefix_mismatch(self):
-        fake = InteractiveBrowserApi(corrupt_prefix=True)
-        driver = self.driver_for(fake)
+        fake = FakeAxiTransport(corrupt_prefix=True)
+        driver, handle = self.staged_driver(fake)
 
         with self.assertRaisesRegex(MODULE.HarnessError, "prefix"):
-            driver.stage(fake.handle, model_manifest().publisher)
+            driver.stage(handle, model_manifest().publisher)
 
-        self.assertEqual(
-            len([call for call in fake.calls if call[0] == "press_key"]), 1
-        )
+        self.assertEqual(len([call for call in fake.calls if call[0] == "press"]), 1)
 
     def test_actions_click_only_desired_unchecked_controls(self):
-        fake = InteractiveBrowserApi()
-        driver = self.driver_for(fake)
+        fake = FakeAxiTransport()
+        driver, handle = self.staged_driver(fake)
 
-        driver.stage(fake.handle, model_manifest().publisher)
+        driver.stage(handle, model_manifest().publisher)
 
         self.assertEqual(fake.checked, {"npm publish"})
         action_clicks = [
-            call for call in fake.calls
-            if call[0] == "click_at_xy" and int(call[1] // 10) in {20, 21}
+            call
+            for call in fake.calls
+            if call[0] == "click"
+            and call[1].split(":", 1)[1] in set(ACTION_IDS.values())
         ]
         self.assertEqual(len(action_clicks), 1)
 
     def test_disabled_save_stops(self):
-        fake = InteractiveBrowserApi(save_disabled=True)
-        driver = self.driver_for(fake)
+        fake = FakeAxiTransport(save_disabled=True)
+        driver, handle = self.staged_driver(fake)
 
-        driver.stage(fake.handle, model_manifest().publisher)
-        outcome = driver.save_and_wait(fake.handle)
+        driver.stage(handle, model_manifest().publisher)
+        outcome = driver.save_and_wait(handle)
 
         self.assertEqual(outcome, "save-failed")
         self.assertFalse(fake.save_clicked)
@@ -669,10 +676,10 @@ class BrowserHarnessInteractionTests(unittest.TestCase):
             ("none", "authentication-ambiguous"),
         ):
             with self.subTest(result=result):
-                fake = InteractiveBrowserApi(save_result=result)
-                driver = self.driver_for(fake, poll_attempts=2)
-                driver.stage(fake.handle, model_manifest().publisher)
-                self.assertEqual(driver.save_and_wait(fake.handle), expected)
+                fake = FakeAxiTransport(save_result=result)
+                driver, handle = self.staged_driver(fake, poll_attempts=2)
+                driver.stage(handle, model_manifest().publisher)
+                self.assertEqual(driver.save_and_wait(handle), expected)
 
     def test_authentication_status_cannot_be_overridden_by_publisher_success(self):
         for message, expected in (
@@ -683,29 +690,29 @@ class BrowserHarnessInteractionTests(unittest.TestCase):
             ("Authentication verified", "success"),
         ):
             with self.subTest(message=message):
-                fake = InteractiveBrowserApi(auth_status_message=message)
-                driver = self.driver_for(fake, poll_attempts=1)
-                driver.stage(fake.handle, model_manifest().publisher)
-                self.assertEqual(driver.save_and_wait(fake.handle), expected)
+                fake = FakeAxiTransport(auth_status_message=message)
+                driver, handle = self.staged_driver(fake)
+                driver.stage(handle, model_manifest().publisher)
+                self.assertEqual(driver.save_and_wait(handle), expected)
 
     def test_save_wait_rejects_stale_success(self):
-        fake = InteractiveBrowserApi(save_result="none", stale_success=True)
-        driver = self.driver_for(fake, poll_attempts=2)
-        driver.stage(fake.handle, model_manifest().publisher)
+        fake = FakeAxiTransport(save_result="none", stale_success=True)
+        driver, handle = self.staged_driver(fake, poll_attempts=2)
+        driver.stage(handle, model_manifest().publisher)
 
-        outcome = driver.save_and_wait(fake.handle)
+        outcome = driver.save_and_wait(handle)
 
         self.assertEqual(outcome, "authentication-ambiguous")
 
     def test_reload_requires_exact_persisted_tuple(self):
-        fake = InteractiveBrowserApi()
-        driver = self.driver_for(fake)
-        driver.stage(fake.handle, model_manifest().publisher)
+        fake = FakeAxiTransport()
+        driver, handle = self.staged_driver(fake)
+        driver.stage(handle, model_manifest().publisher)
         fake.values["Workflow filename"] = "release.yaml"
 
-        driver.reload(fake.handle)
+        driver.reload(handle)
         observation = driver.inspect(
-            fake.handle, "@example/widgets", model_manifest().publisher
+            handle, "@example/widgets", model_manifest().publisher
         )
 
         self.assertEqual(
@@ -713,24 +720,188 @@ class BrowserHarnessInteractionTests(unittest.TestCase):
         )
 
 
-class BrowserHarnessEntrypointTests(unittest.TestCase):
+class AxiStaleRefTests(unittest.TestCase):
+    def test_stale_ref_click_is_retried_once_with_fresh_snapshot(self):
+        fake = FakeAxiTransport(stale_clicks=1)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        driver.stage(handle, model_manifest().publisher)
+
+        clicks = [index for index, call in enumerate(fake.calls) if call[0] == "click"]
+        self.assertGreaterEqual(len(clicks), 2)
+        between = [call[0] for call in fake.calls[clicks[0] + 1 : clicks[1]]]
+        self.assertIn("snapshot", between)
+
+    def test_stale_ref_twice_stops_without_further_browser_actions(self):
+        fake = FakeAxiTransport(stale_clicks=10**6)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        with self.assertRaisesRegex(MODULE.HarnessError, "stale"):
+            driver.stage(handle, model_manifest().publisher)
+
+        self.assertEqual(
+            len([call for call in fake.calls if call[0] == "click"]), 2
+        )
+
+    def test_stale_provider_click_blocks_inspect_as_ui_drift(self):
+        fake = FakeAxiTransport(provider_choice=True, stale_clicks=10**6)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        observation = driver.inspect(
+            handle, "@example/widgets", model_manifest().publisher
+        )
+
+        self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
+
+    def test_refs_are_passed_back_exactly_as_printed_with_generation_prefix(self):
+        fake = FakeAxiTransport()
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        driver.stage(handle, model_manifest().publisher)
+
+        clicks = [call[1] for call in fake.calls if call[0] == "click"]
+        self.assertTrue(clicks)
+        for ref in clicks:
+            self.assertRegex(ref, r"^@g\d+:1_\d+$")
+
+    def test_non_stale_axi_error_fails_closed(self):
+        fake = FakeAxiTransport()
+        driver = make_driver(fake)
+        open_widget(driver)
+
+        original_run = fake.run
+        fake.run = lambda *args: MODULE.AxiResult(
+            1, 'error: "Bridge unreachable"\ncode: BROWSER_ERROR\n'
+        )
+        try:
+            with self.assertRaises(MODULE.HarnessError):
+                driver._axi("snapshot", "--full")
+            with self.assertRaises(MODULE.StaleRefError):
+                raise MODULE.StaleRefError("sanity: subclass relationship")
+        finally:
+            fake.run = original_run
+
+
+class AxiSnapshotParseTests(unittest.TestCase):
+    def test_unparseable_snapshot_blocks_inspect_as_ui_drift(self):
+        fake = FakeAxiTransport(garbage_selectpage=True)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        observation = driver.inspect(
+            handle, "@example/widgets", model_manifest().publisher
+        )
+
+        self.assertEqual(observation, MODULE.Observation("blocked", "ui-drift"))
+
+    def test_unparseable_snapshot_refuses_preflight_in_entrypoint(self):
+        fake = FakeAxiTransport(garbage_selectpage=True)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(json.dumps(valid_manifest()), encoding="utf-8")
+            ledger = Path(directory) / "ledger.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = MODULE.run_axi(
+                    manifest_path=str(manifest),
+                    ledger_path=str(ledger),
+                    transport=fake,
+                )
+            data = json.loads(ledger.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 3)
+        self.assertEqual(
+            data["packages"]["@example/widgets"],
+            {"status": "blocked", "reason": "ui-drift"},
+        )
+
+    def test_truncated_snapshot_fails_closed(self):
+        driver = make_driver(FakeAxiTransport())
+        truncated = (
+            "snapshot:\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+            "    ... (truncated, 90000 chars total)\n"
+        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "truncated"):
+            driver._parse_page(truncated)
+
+    def test_refs_without_generation_tag_fail_closed(self):
+        driver = make_driver(FakeAxiTransport())
+        untagged = (
+            "snapshot:\n"
+            'uid=1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "generation"):
+            driver._parse_page(untagged)
+
+    def test_embedded_quotes_in_names_are_recovered_without_forging_attributes(self):
+        driver = make_driver(FakeAxiTransport())
+        page = (
+            "snapshot:\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+            '  uid=g1:1_9 button "He said "hi"" focusable\n'
+            '  uid=g1:1_8 checkbox "npm publish" checked="true"\n'
+        )
+        _, nodes = driver._parse_page(page)
+
+        button = next(node for node in nodes if node.role == "button")
+        self.assertEqual(button.name, 'He said "hi"')
+        self.assertEqual(button.attrs, {"focusable": True})
+        checkbox = next(node for node in nodes if node.role == "checkbox")
+        with self.assertRaisesRegex(MODULE.HarnessError, "checked"):
+            MODULE.AxiDriver._checked(checkbox)
+
+    def test_unterminated_names_fail_closed(self):
+        driver = make_driver(FakeAxiTransport())
+        broken = (
+            "snapshot:\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+            '  uid=g1:1_9 button "Unterminated\n'
+        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "unparseable"):
+            driver._parse_page(broken)
+
+    def test_inline_single_item_help_lines_are_not_parsed_as_nodes(self):
+        driver = make_driver(FakeAxiTransport())
+        page = (
+            "snapshot:\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+            'help[1]: "Run `chrome-devtools-axi click @g1:1_0` to interact"\n'
+        )
+        url, nodes = driver._parse_page(page)
+
+        self.assertEqual(url, "https://www.npmjs.com/x")
+        self.assertEqual(len(nodes), 1)
+
+
+class AxiEntrypointTests(unittest.TestCase):
     def write_manifest(self, directory):
         path = Path(directory) / "manifest.json"
         path.write_text(json.dumps(valid_manifest()), encoding="utf-8")
         return path
 
-    def test_entrypoint_converges_exact_match_with_restricted_api(self):
-        fake = StaticBrowserApi()
+    def test_entrypoint_converges_exact_match_with_restricted_transport(self):
+        fake = FakeAxiTransport(
+            values={
+                "Organization or user": "example-org",
+                "Repository": "widgets",
+                "Workflow filename": "release.yml",
+            },
+            checked=("npm publish",),
+        )
         with tempfile.TemporaryDirectory() as directory:
             manifest = self.write_manifest(directory)
             ledger = Path(directory) / "ledger.json"
             output = io.StringIO()
 
             with contextlib.redirect_stdout(output):
-                code = MODULE.run_browser_harness(
+                code = MODULE.run_axi(
                     manifest_path=str(manifest),
                     ledger_path=str(ledger),
-                    api=fake.mapping(),
+                    transport=fake,
                 )
 
             data = json.loads(ledger.read_text(encoding="utf-8"))
@@ -740,24 +911,17 @@ class BrowserHarnessEntrypointTests(unittest.TestCase):
         )
         self.assertEqual(output.getvalue(), "@example/widgets: exact-match\n")
 
-    def test_entrypoint_redacts_harness_exception(self):
-        fake = StaticBrowserApi()
-
-        def fail_without_disclosure(url):
-            raise RuntimeError("sensitive browser detail")
-
-        api = fake.mapping()
-        api["new_tab"] = fail_without_disclosure
+    def test_entrypoint_redacts_transport_exception(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest = self.write_manifest(directory)
             ledger = Path(directory) / "ledger.json"
             output = io.StringIO()
 
             with contextlib.redirect_stdout(output):
-                code = MODULE.run_browser_harness(
+                code = MODULE.run_axi(
                     manifest_path=str(manifest),
                     ledger_path=str(ledger),
-                    api=api,
+                    transport=RaisingTransport(),
                 )
 
             data = json.loads(ledger.read_text(encoding="utf-8"))
@@ -767,6 +931,24 @@ class BrowserHarnessEntrypointTests(unittest.TestCase):
             data["packages"]["@example/widgets"],
             {"status": "blocked", "reason": "harness-error"},
         )
+
+    def test_main_fails_closed_when_pinned_cli_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self.write_manifest(directory)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = MODULE.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--ledger",
+                        str(Path(directory) / "ledger.json"),
+                        "--axi-script",
+                        str(Path(directory) / "missing" / "chrome-devtools-axi.js"),
+                    ]
+                )
+        self.assertEqual(code, 5)
+        self.assertIn("blocked", output.getvalue())
 
 
 class ConvergerSequentialTests(unittest.TestCase):

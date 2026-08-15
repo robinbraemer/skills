@@ -4,7 +4,7 @@ Public Agent Skills shared by Robin Braemer.
 
 ## Skills
 
-- [`converging-npm-trusted-publishers`](converging-npm-trusted-publishers/SKILL.md) — fail-closed guidance and a tested helper for reconciling an explicit npm package allowlist to one GitHub Actions Trusted Publisher tuple through browser-harness and the user's visible Chrome profile.
+- [`converging-npm-trusted-publishers`](converging-npm-trusted-publishers/SKILL.md) — fail-closed guidance and a tested helper for reconciling an explicit npm package allowlist to one GitHub Actions Trusted Publisher tuple through the pinned chrome-devtools-axi CLI and the user's visible Chrome profile.
 
   It skips exact matches, refuses unexpected publishers or UI drift, leaves WebAuthn to the human, supports redacted resume after partial completion, and requires exact post-save read-back without exposing browser or authentication material.
 
