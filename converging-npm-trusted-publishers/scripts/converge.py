@@ -72,6 +72,20 @@ BLOCK_REASONS = {
 }
 
 
+DEBUG_CLASSIFY = False
+
+
+def _debug_classify(message: str) -> None:
+    """Redaction-safe classifier tracing (--debug-classify).
+
+    Prints only fixed diagnostic strings, role/name booleans, and the observed
+    publisher tuple (public information); never page content, URLs beyond the
+    canonical package URL match result, or session material.
+    """
+    if DEBUG_CLASSIFY:
+        print(f"debug-classify: {message}")
+
+
 class ManifestError(ValueError):
     """The manifest cannot be interpreted without guessing."""
 
@@ -450,8 +464,10 @@ class AxiTransport:
 
 
 _NODE_LINE_RE = re.compile(
-    r"^\s*uid=(?P<uid>\S+)\s+(?P<role>[A-Za-z][A-Za-z0-9-]*)(?P<rest>.*)$"
+    r"^\s*uid=(?P<uid>\S+)\s+(?P<role>[A-Za-z][A-Za-z0-9-]*)(?P<rest>.*)$",
+    re.DOTALL,
 )
+_NODE_START_RE = re.compile(r"^\s*uid=\S")
 _ATTRS_ONLY_RE = re.compile(r'(?:\s+[A-Za-z_][A-Za-z0-9_]*(?:="[^"]*")?)*\s*')
 _ATTR_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)(?:="([^"]*)")?')
 _UID_RE = re.compile(r"^g\d+:\S+$")
@@ -567,15 +583,24 @@ class AxiDriver:
         )
         if start is None:
             raise HarnessError("axi output has no snapshot section")
-        nodes: list[AxNode] = []
+        # Accessible names are rendered unescaped by the upstream formatter, so
+        # a name containing a literal newline (LineBreak nodes, multi-line
+        # text) splits one node across several physical lines. Rejoin: a line
+        # starting with "uid=" opens a node; anything else continues the
+        # current node's name verbatim.
+        logical_lines: list[str] = []
         for line in lines[start + 1 :]:
             if _HELP_BLOCK_RE.match(line):
                 break
-            if not line.strip():
-                continue
             if "(truncated," in line:
                 raise HarnessError("snapshot was truncated")
-            nodes.append(self._parse_node(line))
+            if _NODE_START_RE.match(line):
+                logical_lines.append(line)
+            elif logical_lines:
+                logical_lines[-1] += "\n" + line
+            elif line.strip():
+                raise HarnessError("unparseable snapshot line")
+        nodes = [self._parse_node(line) for line in logical_lines]
         if not nodes or nodes[0].role != "RootWebArea":
             raise HarnessError("snapshot has no root web area")
         url = nodes[0].attrs.get("url")
@@ -858,15 +883,21 @@ class AxiDriver:
         try:
             url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
             if url != package_url(package):
+                _debug_classify(f"{package}: canonical-url-match=False")
                 return Observation("blocked", "identity-mismatch")
             if len(self._package_headings(tree, package)) != 1:
+                _debug_classify(f"{package}: package-heading-unique=False")
                 return Observation("blocked", "identity-mismatch")
             if len(self._matches(tree, "heading", SECTION_HEADING)) != 1:
+                _debug_classify(f"{package}: section-heading-unique=False")
                 return Observation("blocked", "ui-drift")
             if self._matches(tree, "button", EDIT_BUTTON_LABEL):
+                _debug_classify(f"{package}: view=summary")
                 return self._classify_summary(tree, publisher, previous)
+            _debug_classify(f"{package}: view=form")
             return self._classify_form(self._form(tree), publisher, previous)
-        except HarnessError:
+        except HarnessError as error:
+            _debug_classify(f"{package}: ui-drift ({error})")
             return Observation("blocked", "ui-drift")
 
     def _classify_summary(
@@ -874,6 +905,11 @@ class AxiDriver:
     ) -> Observation:
         owner, repository, workflow, actions = self._summary(tree)
         observed = (owner, repository, workflow, None)
+        _debug_classify(
+            f"summary tuple {owner}/{repository} {workflow} actions={sorted(actions)} "
+            f"target-match={observed == publisher.tuple_key()} "
+            f"previous-match={previous is not None and observed == previous.tuple_key()}"
+        )
         if observed == publisher.tuple_key() and actions == set(
             publisher.allowed_actions
         ):
@@ -1071,10 +1107,18 @@ def _desired_values(publisher: Publisher) -> dict[str, str]:
 
 
 class Converger:
-    def __init__(self, manifest: Manifest, ledger: LedgerStore, driver: Any):
+    def __init__(
+        self,
+        manifest: Manifest,
+        ledger: LedgerStore,
+        driver: Any,
+        *,
+        stop_before_save: bool = False,
+    ):
         self.manifest = manifest
         self.ledger = ledger
         self.driver = driver
+        self.stop_before_save = stop_before_save
         self.handles: dict[str, Any] = {}
 
     def _blocked(self, package: str, reason: str, code: int) -> int:
@@ -1134,6 +1178,12 @@ class Converger:
                 self.ledger.set(package, "staged")
                 self.ledger.set(package, "awaiting-human-auth")
 
+            if self.stop_before_save:
+                # Deliberate pre-authentication stop: the form is staged and
+                # verified but nothing was persisted. Resume by rerunning
+                # without --stop-before-save.
+                return 4
+
             outcome = self.driver.save_and_wait(handle)
             if outcome != "success":
                 reason = {
@@ -1166,7 +1216,13 @@ def _print_ledger(manifest: Manifest, ledger: LedgerStore) -> None:
         print(f"{package}: {record['status']}{suffix}")
 
 
-def run_axi(*, manifest_path: str, ledger_path: str, transport: Any) -> int:
+def run_axi(
+    *,
+    manifest_path: str,
+    ledger_path: str,
+    transport: Any,
+    stop_before_save: bool = False,
+) -> int:
     try:
         manifest = load_manifest(manifest_path)
         ledger = LedgerStore(ledger_path, manifest)
@@ -1176,7 +1232,9 @@ def run_axi(*, manifest_path: str, ledger_path: str, transport: Any) -> int:
 
     try:
         driver = AxiDriver(transport)
-        code = Converger(manifest, ledger, driver).run()
+        code = Converger(
+            manifest, ledger, driver, stop_before_save=stop_before_save
+        ).run()
     except Exception:
         package = next(
             (
@@ -1209,7 +1267,20 @@ def main(argv: list[str] | None = None) -> int:
         help="pinned chrome-devtools-axi.js path (default: vendored install)",
     )
     parser.add_argument("--bun", default="bun", help="bun executable used to run the pinned CLI")
+    parser.add_argument(
+        "--stop-before-save",
+        action="store_true",
+        help="stage and verify the first pending package, then stop before Save/authentication",
+    )
+    parser.add_argument(
+        "--debug-classify",
+        action="store_true",
+        help="print redaction-safe classifier diagnostics (booleans and the public publisher tuple only)",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.debug_classify:
+        global DEBUG_CLASSIFY
+        DEBUG_CLASSIFY = True
 
     try:
         transport = AxiTransport(
@@ -1223,6 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path=arguments.manifest,
         ledger_path=arguments.ledger,
         transport=transport,
+        stop_before_save=arguments.stop_before_save,
     )
 
 

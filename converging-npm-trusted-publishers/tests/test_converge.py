@@ -709,23 +709,94 @@ class FakeAxiTransport:
         lines.append(f'  {self._uid(DELETE_ID)} button "{DELETE_LABEL}"')
         return lines
 
+    def _chrome_prefix_lines(self):
+        # Faithful replica of the live access page chrome, including LineBreak
+        # nodes whose accessible name is a literal newline (rendered across two
+        # physical lines by the real formatter) and named/empty live regions.
+        return [
+            f'  {self._uid("5_1")} region "Site notifications"',
+            f'    {self._uid("5_2")} StaticText "⚠️"',
+            f'    {self._uid("5_3")} alert atomic live="assertive" relevant="additions text"',
+            f'      {self._uid("5_4")} StaticText "npm tokens that bypass 2FA are being restricted — account changes (Aug 2026) and direct publishing (Jan 2027). "',
+            f'      {self._uid("5_5")} link "Learn how to prepare for the npm bypass 2FA token deprecation" url="https://github.blog/changelog/example"',
+            f'    {self._uid("5_6")} button "Close notification"',
+            f'  {self._uid("5_7")} link "skip to content" url="{self.url}#main"',
+            f'  {self._uid("5_8")} StaticText "npm"',
+            f'  {self._uid("5_9")} link "Npm" url="https://www.npmjs.com/"',
+            f'  {self._uid("5_10")} form',
+            f'    {self._uid("5_11")} combobox "Search packages" expandable haspopup="listbox"',
+            f'    {self._uid("5_12")} generic atomic live="polite" relevant="additions text"',
+            f'    {self._uid("5_13")} button "Search"',
+            f'  {self._uid("5_14")} navigation',
+            f'    {self._uid("5_15")} button "Profile menu"',
+            f'  {self._uid("5_16")} main',
+        ]
+
+    def _chrome_tabs_lines(self):
+        return [
+            f'    {self._uid("5_20")} StaticText "0.8.25"',
+            f'    {self._uid("5_21")} StaticText " • "',
+            f'    {self._uid("5_22")} StaticText "Public"',
+            f'    {self._uid("5_23")} tab " Readme" selectable',
+            f'    {self._uid("5_24")} tab "Code Beta" selectable',
+            f'    {self._uid("5_25")} tab "4 Dependencies" selectable',
+            f'    {self._uid("5_26")} tab "0 Dependents" selectable',
+            f'    {self._uid("5_27")} tab "26 Versions" selectable',
+            f'    {self._uid("5_28")} tab " Settings" selectable selected',
+            f'    {self._uid("5_29")} tabpanel " Readme"',
+        ]
+
+    def _section_intro_lines(self):
+        return [
+            f'    {self._uid("5_40")} StaticText "Establish a trust between your package and your repository using OpenID Connect (OIDC)."',
+            f'    {self._uid("5_41")} LineBreak "\n"',
+            f'    {self._uid("5_42")} link "Learn more about OpenID Connect." url="https://gh.io/npm-docs-trusted-publishers"',
+            f'      {self._uid("5_43")} StaticText "Learn more about OpenID Connect."',
+        ]
+
+    def _chrome_suffix_lines(self):
+        return [
+            f'    {self._uid("5_50")} heading "Package access" level="2"',
+            f'    {self._uid("5_51")} StaticText "Status:"',
+            f'    {self._uid("5_52")} StaticText "public"',
+            f'    {self._uid("5_53")} form',
+            f'      {self._uid("5_54")} heading "Publishing access" level="2"',
+            f'      {self._uid("5_55")} radio "Require two-factor authentication and disallow bypass 2fa tokens (recommended)"',
+            f'      {self._uid("5_56")} LineBreak "\n"',
+            f'      {self._uid("5_57")} radio "Require two-factor authentication or a granular access token with bypass 2fa enabled" checked',
+            f'      {self._uid("5_58")} LineBreak "\n"',
+            f'      {self._uid("5_59")} StaticText "Note about trusted publishers"',
+            f'      {self._uid("5_60")} StaticText ": All publishing access options above are compatible with OIDC trusted publishers. If you have configured trusted publishers for this package, they will continue to work regardless of which option you select."',
+            f'      {self._uid("5_61")} button "Update Package Settings"',
+            f'    {self._uid("5_62")} heading "Maintainers 1" level="2"',
+            f'    {self._uid("5_63")} heading "Package Sidebar" level="2"',
+            f'    {self._uid("5_64")} heading "Install" level="3"',
+            f'    {self._uid("5_65")} StaticText "@example/widgets"',
+            f'    {self._uid("5_66")} heading "Repository" level="3"',
+            f'    {self._uid("5_67")} heading "Version" level="3"',
+        ]
+
     def _tree_lines(self):
         lines = [
             f'{self._uid("1_0")} RootWebArea "npm" url="{self.url}" focusable focused'
         ]
+        lines.extend(self._chrome_prefix_lines())
         if self.package_heading is not None:
             lines.append(
-                f'  {self._uid("1_1")} heading "{self.package_heading}" level="1"'
+                f'    {self._uid("1_1")} heading "{self.package_heading}" level="1"'
             )
+        lines.extend(self._chrome_tabs_lines())
         if self.section_heading is not None:
             lines.append(
-                f'  {self._uid("1_2")} heading "{self.section_heading}" level="1"'
+                f'    {self._uid("1_2")} heading "{self.section_heading}" level="1"'
             )
+        lines.extend(self._section_intro_lines())
         if self._in_form():
             lines.extend(self._form_lines())
         else:
             lines.extend(self._summary_lines())
         lines.extend(self._message_lines())
+        lines.extend(self._chrome_suffix_lines())
         return lines
 
     def _message_lines(self):
@@ -1197,6 +1268,54 @@ class MigrationTests(unittest.TestCase):
         )
         self.assertFalse(fake.delete_clicked)
 
+    def test_stop_before_save_stages_then_halts_without_saving(self):
+        fake = FakeAxiTransport(publisher_state=summary_state())
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(directory, valid_manifest_v2())
+            ledger_path = Path(directory) / "ledger.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = MODULE.run_axi(
+                    manifest_path=str(manifest_path),
+                    ledger_path=str(ledger_path),
+                    transport=fake,
+                    stop_before_save=True,
+                )
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 4)
+        self.assertEqual(
+            ledger["packages"]["@example/widgets"], {"status": "migrating"}
+        )
+        self.assertFalse(fake.save_clicked)
+        self.assertFalse(fake.delete_clicked)
+        # The staged form holds the target, but nothing was persisted.
+        self.assertEqual(fake.values["Repository*"], "widgets")
+        self.assertEqual(fake.publisher_state["repository"], "widgets-old")
+
+    def test_debug_classify_prints_only_redaction_safe_tuple_data(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(owner="other-org", repository="legacy")
+        )
+        output = io.StringIO()
+        MODULE.DEBUG_CLASSIFY = True
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                manifest_path = self.write_manifest(directory, valid_manifest_v2())
+                with contextlib.redirect_stdout(output):
+                    MODULE.run_axi(
+                        manifest_path=str(manifest_path),
+                        ledger_path=str(Path(directory) / "ledger.json"),
+                        transport=fake,
+                    )
+        finally:
+            MODULE.DEBUG_CLASSIFY = False
+
+        text = output.getvalue()
+        self.assertIn("debug-classify: @example/widgets: view=summary", text)
+        self.assertIn("summary tuple other-org/legacy", text)
+        self.assertIn("target-match=False", text)
+        self.assertNotIn("https://", text)
+
     def test_migration_clearing_readback_mismatch_stops(self):
         fake = FakeAxiTransport(publisher_state=summary_state(), corrupt_backspace=True)
         driver = make_driver(fake)
@@ -1360,6 +1479,73 @@ class AxiSnapshotParseTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(MODULE.HarnessError, "unparseable"):
             driver._parse_page(broken)
+
+    def test_linebreak_nodes_spanning_physical_lines_are_parsed(self):
+        # Live regression: the npm access page renders LineBreak nodes whose
+        # accessible name is a literal newline, so one node spans two physical
+        # lines. The parser must rejoin them instead of failing the page.
+        driver = make_driver(FakeAxiTransport())
+        page = (
+            "snapshot:\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+            '  uid=g1:1_1 StaticText "Establish a trust between your package and your repository using OpenID Connect (OIDC)."\n'
+            '  uid=g1:1_2 LineBreak "\n'
+            '"\n'
+            '  uid=g1:1_3 link "Learn more about OpenID Connect." url="https://gh.io/npm-docs-trusted-publishers"\n'
+        )
+        _, nodes = driver._parse_page(page)
+
+        self.assertEqual(len(nodes), 4)
+        linebreak = next(node for node in nodes if node.role == "LineBreak")
+        self.assertEqual(linebreak.name, "\n")
+        self.assertEqual(nodes[-1].attrs["url"], "https://gh.io/npm-docs-trusted-publishers")
+
+    def test_multiline_names_with_trailing_attributes_are_parsed(self):
+        driver = make_driver(FakeAxiTransport())
+        page = (
+            "snapshot:\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+            '  uid=g1:1_1 StaticText "first line\n'
+            "second line\n"
+            '\n'
+            'third after blank" focusable\n'
+        )
+        _, nodes = driver._parse_page(page)
+
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[1].name, "first line\nsecond line\n\nthird after blank")
+        self.assertEqual(nodes[1].attrs, {"focusable": True})
+
+    def test_orphan_text_before_first_node_fails_closed(self):
+        driver = make_driver(FakeAxiTransport())
+        page = (
+            "snapshot:\n"
+            "stray text before any node\n"
+            'uid=g1:1_0 RootWebArea "npm" url="https://www.npmjs.com/x"\n'
+        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "unparseable"):
+            driver._parse_page(page)
+
+    def test_full_live_page_chrome_classifies_summary_and_form(self):
+        # The fake renders the complete live page chrome (notification alert,
+        # tabs, LineBreak intro, radios, sidebar). Both views must classify.
+        summary_fake = FakeAxiTransport(
+            publisher_state=summary_state(repository="widgets", workflow="release.yml")
+        )
+        driver = make_driver(summary_fake)
+        handle = open_widget(driver)
+        self.assertEqual(
+            driver.inspect(handle, "@example/widgets", model_publisher()),
+            MODULE.Observation("exact"),
+        )
+
+        form_fake = FakeAxiTransport()
+        driver = make_driver(form_fake)
+        handle = open_widget(driver)
+        self.assertEqual(
+            driver.inspect(handle, "@example/widgets", model_publisher()),
+            MODULE.Observation("absent"),
+        )
 
     def test_inline_single_item_help_lines_are_not_parsed_as_nodes(self):
         driver = make_driver(FakeAxiTransport())
