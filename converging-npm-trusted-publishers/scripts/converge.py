@@ -37,7 +37,7 @@ PINNED_AXI_VERSION = "0.1.29"
 # else (eval/run, fill/fillform/type, screenshot, console/network, heap,
 # lighthouse, perf-*, update, ...) is refused before any subprocess is spawned.
 AXI_ALLOWED_COMMANDS = frozenset(
-    {"newpage", "selectpage", "pages", "snapshot", "click", "press", "open"}
+    {"newpage", "selectpage", "pages", "snapshot", "click", "press", "open", "closepage"}
 )
 # Named keys allowed for clearing a prefilled field during an authorized
 # migration edit. Every press is followed by an exact value read-back.
@@ -495,6 +495,8 @@ class AxiDriver:
         *,
         poll_attempts: int = 600,
         poll_interval: float = 0.5,
+        render_attempts: int = 5,
+        render_interval: float = 1.0,
         sleeper: Callable[[float], None] = time.sleep,
     ):
         run = getattr(transport, "run", None)
@@ -502,9 +504,13 @@ class AxiDriver:
             raise HarnessError("axi transport does not provide a run command")
         if poll_attempts < 1 or poll_interval < 0:
             raise HarnessError("invalid save polling bounds")
+        if render_attempts < 1 or render_interval < 0:
+            raise HarnessError("invalid render settling bounds")
         self.transport = transport
         self.poll_attempts = poll_attempts
         self.poll_interval = poll_interval
+        self.render_attempts = render_attempts
+        self.render_interval = render_interval
         self.sleeper = sleeper
         self.tabs: list[tuple[str, str, str]] = []
 
@@ -646,6 +652,15 @@ class AxiDriver:
         handle = added[0]
         self.tabs.append((handle, package, url))
         return handle
+
+    def close_tabs(self) -> None:
+        """Close every tab this run opened (never the user's own tabs)."""
+        for handle, _, _ in self.tabs:
+            try:
+                self._axi("closepage", handle)
+            except HarnessError:
+                continue
+        self.tabs = []
 
     def _expected(self, handle: Any) -> tuple[str, str]:
         matches = [
@@ -871,6 +886,31 @@ class AxiDriver:
         ):
             raise HarnessError("staged form read-back mismatch")
 
+    def _settled_page(self, handle: Any, package: str) -> tuple[str, list[AxNode]]:
+        """Select the tab and wait briefly for the SPA to finish rendering.
+
+        npm hydrates the access page after load; a snapshot taken too early
+        lacks the package heading or publisher section. Re-snapshot a bounded
+        number of times until the identity anchors and a publisher view are
+        present, then hand the tree to the normal fail-closed checks (which
+        still stop the run if the page never settles).
+        """
+        url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
+        for _ in range(self.render_attempts - 1):
+            if (
+                url == package_url(package)
+                and len(self._package_headings(tree, package)) == 1
+                and len(self._matches(tree, "heading", SECTION_HEADING)) == 1
+                and (
+                    self._matches(tree, "button", EDIT_BUTTON_LABEL)
+                    or self._matches(tree, "button", SAVE_BUTTON_LABEL)
+                )
+            ):
+                break
+            self.sleeper(self.render_interval)
+            url, tree = self._parse_page(self._axi("snapshot", "--full"))
+        return url, tree
+
     # --- driver surface used by the converger ---
 
     def inspect(
@@ -881,7 +921,7 @@ class AxiDriver:
         previous: Publisher | None = None,
     ) -> Observation:
         try:
-            url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
+            url, tree = self._settled_page(handle, package)
             if url != package_url(package):
                 _debug_classify(f"{package}: canonical-url-match=False")
                 return Observation("blocked", "identity-mismatch")
@@ -1242,6 +1282,7 @@ def run_axi(
         print("blocked: invalid manifest or ledger")
         return 2
 
+    driver = None
     try:
         driver = AxiDriver(transport)
         code = Converger(
@@ -1262,6 +1303,12 @@ def run_axi(
         except LedgerError:
             pass
         code = 5
+    finally:
+        if driver is not None:
+            try:
+                driver.close_tabs()
+            except Exception:
+                pass
 
     _print_ledger(manifest, ledger)
     return code

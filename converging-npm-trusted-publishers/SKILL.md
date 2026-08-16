@@ -54,7 +54,7 @@ The existing-connection summary never displays an environment, so only environme
 
 1. Confirm the pinned AXI bridge is already attached to the intended visible Chrome profile without printing the current tab, profile, or session details. If the vendored install is missing, stop and follow `browser-with-axi` — do not substitute another driver.
 2. Resolve this skill directory and user-approved manifest/ledger paths. Keep the ledger local and out of version control.
-3. Run the helper. It opens one visible npm tab per package, globally inspects every package before the first write, skips exact matches, and processes creations and approved migrations sequentially.
+3. Run the helper. It opens one visible npm tab per package (closing its own tabs again when the run ends — never the user's), waits briefly for each page to finish rendering, globally inspects every package before the first write, skips exact matches, and processes creations and approved migrations sequentially.
 4. Warn the human before Save may trigger authentication — for both new connections and migration edits. While the helper waits, do not issue browser input. The human alone completes or cancels authentication.
 5. A nonzero exit is a safe stop. Report only package status and reason code. Fix no state automatically; resume by rerunning the same manifest and ledger after the human resolves the cause.
 6. Claim success only on exit `0`, after the helper's final read-back sweep.

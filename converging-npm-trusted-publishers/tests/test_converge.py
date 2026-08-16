@@ -505,6 +505,7 @@ class FakeAxiTransport:
         duplicate_field=None,
         disabled_field=None,
         edit_prefill_override=None,
+        settle_after=0,
     ):
         self.url = url
         self.package_heading = package_heading
@@ -524,6 +525,8 @@ class FakeAxiTransport:
         self.duplicate_field = duplicate_field
         self.disabled_field = disabled_field
         self.edit_prefill_override = edit_prefill_override
+        self.settle_after = settle_after
+        self.snapshots_rendered = 0
         self.editing = False
         self.values = {label: "" for label in FIELD_IDS}
         self.checked = set()
@@ -579,6 +582,11 @@ class FakeAxiTransport:
         if command == "press":
             self._press(args[1])
             return self._page_output()
+        if command == "closepage":
+            if args[1] not in self.pages or len(self.pages) <= 1:
+                return self._error("cannot close", "VALIDATION_ERROR", 2)
+            del self.pages[args[1]]
+            return MODULE.AxiResult(0, f"status: closed\npageId: {args[1]}\n")
         return self._error(f"Unknown command: {command}", "VALIDATION_ERROR", 2)
 
     # --- interaction semantics ---
@@ -836,6 +844,18 @@ class FakeAxiTransport:
 
     def _page_output(self):
         self.generation += 1
+        self.snapshots_rendered += 1
+        if self.snapshots_rendered <= self.settle_after:
+            # Simulate npm's SPA before hydration: chrome only, no publisher
+            # section or package heading yet.
+            skeleton = [
+                f'{self._uid("1_0")} RootWebArea "npm" url="{self.url}" focusable focused',
+                *self._chrome_prefix_lines(),
+            ]
+            body = "\n".join(
+                ["page:", '  title: "npm"', f"  refs: {len(skeleton)}", "snapshot:", *skeleton]
+            )
+            return MODULE.AxiResult(0, body + "\n")
         tree = self._tree_lines()
         body = "\n".join(
             [
@@ -1338,6 +1358,53 @@ class MigrationTests(unittest.TestCase):
             driver.migrate_stage(handle, model_previous(), model_publisher())
 
         self.assertEqual(len([call for call in fake.calls if call[0] == "press"]), 0)
+
+
+class RenderSettleAndTabCleanupTests(unittest.TestCase):
+    def test_inspect_waits_for_spa_hydration_before_classifying(self):
+        # newpage renders one skeleton (settle_after consumes outputs in
+        # order); the following selectpage + retries hydrate late.
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(repository="widgets", workflow="release.yml"),
+            settle_after=3,
+        )
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
+
+        self.assertEqual(observation, MODULE.Observation("exact"))
+        self.assertGreaterEqual(
+            len([call for call in fake.calls if call[0] == "snapshot"]), 1
+        )
+
+    def test_page_that_never_settles_still_fails_closed(self):
+        fake = FakeAxiTransport(package_heading=None)
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
+
+        self.assertEqual(observation.reason, "identity-mismatch")
+
+    def test_run_closes_only_its_own_tabs_on_success_and_on_stop(self):
+        for state, expect_code in (
+            (summary_state(repository="widgets", workflow="release.yml"), 0),
+            (summary_state(owner="other-org", repository="legacy"), 3),
+        ):
+            with self.subTest(code=expect_code):
+                fake = FakeAxiTransport(publisher_state=state)
+                with tempfile.TemporaryDirectory() as directory:
+                    manifest = Path(directory) / "manifest.json"
+                    manifest.write_text(json.dumps(valid_manifest()), encoding="utf-8")
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = MODULE.run_axi(
+                            manifest_path=str(manifest),
+                            ledger_path=str(Path(directory) / "ledger.json"),
+                            transport=fake,
+                        )
+                self.assertEqual(code, expect_code)
+                self.assertEqual(set(fake.pages), {"0"})
 
 
 class AxiStaleRefTests(unittest.TestCase):
