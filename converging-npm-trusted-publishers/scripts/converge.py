@@ -886,7 +886,13 @@ class AxiDriver:
                 _debug_classify(f"{package}: canonical-url-match=False")
                 return Observation("blocked", "identity-mismatch")
             if len(self._package_headings(tree, package)) != 1:
-                _debug_classify(f"{package}: package-heading-unique=False")
+                step_up = bool(
+                    self._matches(tree, "heading", "Two-Factor Authentication")
+                )
+                _debug_classify(
+                    f"{package}: package-heading-unique=False "
+                    f"auth-step-up-detected={step_up}"
+                )
                 return Observation("blocked", "identity-mismatch")
             if len(self._matches(tree, "heading", SECTION_HEADING)) != 1:
                 _debug_classify(f"{package}: section-heading-unique=False")
@@ -1184,6 +1190,12 @@ class Converger:
                 # without --stop-before-save.
                 return 4
 
+            # Announce the human-authentication step so the operator log warns
+            # before every Save; only the human acts on the credential prompt.
+            print(
+                f"{package}: saving now - complete the security-key prompt in Chrome",
+                flush=True,
+            )
             outcome = self.driver.save_and_wait(handle)
             if outcome != "success":
                 reason = {
