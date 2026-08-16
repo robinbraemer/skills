@@ -1136,16 +1136,19 @@ class AxiDriver:
             if url != expected_url:
                 return "save-failed"
             if len(self._package_headings(tree, package)) != 1:
-                # Writes trigger npm's 2FA step-up in place: the package page
-                # is replaced by the challenge at the same URL. That is the
-                # human's turn, not a failure - keep waiting.
+                # Two transient in-place states share this shape: npm's 2FA
+                # write step-up (the human's turn) and the skeleton re-render
+                # right after a sudo-fresh save. Neither is a failure - keep
+                # waiting; a page that never recovers exhausts the poll budget
+                # and stops as authentication-ambiguous (resumable).
                 if self._auth_challenge_shown(tree):
                     _debug_classify(f"{package}: awaiting-human-2fa=True")
-                    if attempt + 1 < self.poll_attempts:
-                        self.sleeper(self.poll_interval)
-                        url, tree = self._parse_page(self._axi("snapshot", "--full"))
-                    continue
-                return "save-failed"
+                else:
+                    _debug_classify(f"{package}: transient-render-no-heading=True")
+                if attempt + 1 < self.poll_attempts:
+                    self.sleeper(self.poll_interval)
+                    url, tree = self._parse_page(self._axi("snapshot", "--full"))
+                continue
             if self._summary_shows_target(tree, publisher):
                 # npm re-rendered the persisted summary with the target tuple:
                 # stronger success proof than any banner. The converger still

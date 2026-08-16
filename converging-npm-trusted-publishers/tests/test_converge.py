@@ -526,6 +526,7 @@ class FakeAxiTransport:
         extra_tab_on_newpage=False,
         save_requires_stepup=0,
         wander_after_save=False,
+        skeleton_after_save=0,
     ):
         self.url = url
         self.package_heading = package_heading
@@ -552,6 +553,7 @@ class FakeAxiTransport:
         self.extra_tab_on_newpage = extra_tab_on_newpage
         self.save_requires_stepup = save_requires_stepup
         self.wander_after_save = wander_after_save
+        self.skeleton_after_save = skeleton_after_save
         self.stepup_pending = 0
         self.foreign_pages = set()
         self.snapshots_rendered = 0
@@ -668,6 +670,8 @@ class FakeAxiTransport:
             self.save_clicked = True
             if self.wander_after_save:
                 self.package_heading = None
+            if self.skeleton_after_save:
+                self.settle_after = self.snapshots_rendered + self.skeleton_after_save
             if self.save_requires_stepup:
                 self.stepup_pending = self.save_requires_stepup
             else:
@@ -1251,14 +1255,34 @@ class AxiInteractionTests(unittest.TestCase):
         self.assertEqual(outcome, "authentication-ambiguous")
         self.assertEqual(fake.publisher_state["repository"], "widgets-old")
 
-    def test_save_page_losing_identity_without_challenge_fails(self):
+    def test_save_page_losing_identity_without_challenge_waits_then_ambiguous(self):
+        # A skeleton re-render right after a sudo-fresh save has no heading
+        # and no challenge; the wait must not instant-fail on it. A page that
+        # never recovers exhausts the budget as a resumable ambiguous stop.
         fake = FakeAxiTransport(wander_after_save=True, commit_on_save=False)
-        driver, handle = self.staged_driver(fake)
+        driver, handle = self.staged_driver(fake, poll_attempts=3)
         driver.stage(handle, model_publisher())
 
         outcome = driver.save_and_wait(handle, model_publisher())
 
-        self.assertEqual(outcome, "save-failed")
+        self.assertEqual(outcome, "authentication-ambiguous")
+        polls = [call for call in fake.calls if call == ("snapshot", "--full")]
+        self.assertGreaterEqual(len(polls), 2)
+
+    def test_save_recovers_after_transient_skeleton_render(self):
+        # Live regression (native-engines): a sudo-fresh save re-renders the
+        # page as an unhydrated skeleton for a few frames; the wait must poll
+        # through it instead of instant-failing.
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(), skeleton_after_save=2
+        )
+        driver, handle = self.staged_driver(fake, poll_attempts=6)
+        driver.migrate_stage(handle, model_previous(), model_publisher())
+
+        outcome = driver.save_and_wait(handle, model_publisher())
+
+        self.assertEqual(outcome, "success")
+        self.assertEqual(fake.publisher_state["repository"], "widgets")
 
     def test_save_wait_rejects_stale_success(self):
         fake = FakeAxiTransport(save_result="none", stale_success=True)
