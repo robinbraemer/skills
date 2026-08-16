@@ -521,6 +521,9 @@ class FakeAxiTransport:
         edit_prefill_override=None,
         settle_after=0,
         dead_until_reload=False,
+        newpage_error=False,
+        newpage_creates_tab=True,
+        extra_tab_on_newpage=False,
     ):
         self.url = url
         self.package_heading = package_heading
@@ -542,6 +545,10 @@ class FakeAxiTransport:
         self.edit_prefill_override = edit_prefill_override
         self.settle_after = settle_after
         self.dead_until_reload = dead_until_reload
+        self.newpage_error = newpage_error
+        self.newpage_creates_tab = newpage_creates_tab
+        self.extra_tab_on_newpage = extra_tab_on_newpage
+        self.foreign_pages = set()
         self.snapshots_rendered = 0
         self.editing = False
         self.values = {label: "" for label in FIELD_IDS}
@@ -561,11 +568,19 @@ class FakeAxiTransport:
         self.calls.append(tuple(args))
         command = args[0]
         if command == "newpage":
-            page_id = str(self.next_page_id)
-            self.next_page_id += 1
-            self.pages[page_id] = args[1]
-            if "--background" not in args:
-                self.selected = page_id
+            if self.extra_tab_on_newpage:
+                foreign_id = str(self.next_page_id)
+                self.next_page_id += 1
+                self.pages[foreign_id] = "https://example.com/user-browsing"
+                self.foreign_pages.add(foreign_id)
+            if self.newpage_creates_tab:
+                page_id = str(self.next_page_id)
+                self.next_page_id += 1
+                self.pages[page_id] = args[1]
+                if "--background" not in args:
+                    self.selected = page_id
+            if self.newpage_error:
+                return self._error("Failed to snapshot focused page", "BROWSER_ERROR")
             return self._page_output()
         if command == "pages":
             # Mirror the pinned CLI's real output: the url column carries a
@@ -863,6 +878,16 @@ class FakeAxiTransport:
     def _page_output(self):
         self.generation += 1
         self.snapshots_rendered += 1
+        if self.selected in self.foreign_pages:
+            foreign = [
+                f'{self._uid("9_0")} RootWebArea "user page" '
+                f'url="{self.pages[self.selected]}" focusable focused',
+                f'  {self._uid("9_1")} heading "Something else" level="1"',
+            ]
+            body = "\n".join(
+                ["page:", '  title: "other"', f"  refs: {len(foreign)}", "snapshot:", *foreign]
+            )
+            return MODULE.AxiResult(0, body + "\n")
         if self.dead_until_reload or self.snapshots_rendered <= self.settle_after:
             # Simulate npm's SPA before hydration: chrome only, no publisher
             # section or package heading yet.
@@ -1431,6 +1456,44 @@ class RenderSettleAndTabCleanupTests(unittest.TestCase):
         newpage_calls = [call for call in fake.calls if call[0] == "newpage"]
         self.assertEqual(len(newpage_calls), 1)
         self.assertIn("--background", newpage_calls[0])
+
+    def test_newpage_snapshot_failure_is_tolerated_when_the_tab_exists(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(repository="widgets", workflow="release.yml"),
+            newpage_error=True,
+        )
+        driver = make_driver(fake)
+
+        handle = open_widget(driver)
+
+        self.assertEqual(handle, "1")
+        self.assertEqual(
+            driver.inspect(handle, "@example/widgets", model_publisher()),
+            MODULE.Observation("exact"),
+        )
+
+    def test_newpage_failure_without_a_tab_fails_closed(self):
+        fake = FakeAxiTransport(newpage_error=True, newpage_creates_tab=False)
+        driver = make_driver(fake)
+
+        with self.assertRaisesRegex(MODULE.HarnessError, "uniquely identifiable"):
+            open_widget(driver)
+
+    def test_concurrent_user_tabs_are_disambiguated_by_canonical_url(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(repository="widgets", workflow="release.yml"),
+            extra_tab_on_newpage=True,
+        )
+        driver = make_driver(fake)
+
+        handle = open_widget(driver)
+
+        self.assertNotIn(handle, fake.foreign_pages)
+        self.assertEqual(fake.pages[handle], PACKAGE_URL)
+        self.assertEqual(
+            driver.inspect(handle, "@example/widgets", model_publisher()),
+            MODULE.Observation("exact"),
+        )
 
     def test_run_closes_only_its_own_tabs_on_success_and_on_stop(self):
         for state, expect_code in (

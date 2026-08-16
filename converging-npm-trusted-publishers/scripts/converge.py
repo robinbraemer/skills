@@ -648,10 +648,32 @@ class AxiDriver:
         before = set(self._page_ids())
         # Background tabs avoid stealing the user's focus; pacing the opens
         # avoids tripping npm's rate limiting with a burst of page loads.
-        self._axi("newpage", url, "--background", "--full")
+        try:
+            self._axi("newpage", url, "--background", "--full")
+        except HarnessError:
+            # newpage snapshots whatever tab the user currently has focused,
+            # which can fail (e.g. chrome:// pages) even though the new tab
+            # was created. The pages diff plus URL proof below is the real
+            # gate for whether the open worked.
+            _debug_classify(f"{package}: newpage-command-failed=True")
         added = [page_id for page_id in self._page_ids() if page_id not in before]
         if len(added) != 1:
-            raise HarnessError("newly opened page is not uniquely identifiable")
+            # The user's own browsing can add unrelated tabs concurrently.
+            # Identify ours by the canonical URL proven from each candidate's
+            # own snapshot root; anything ambiguous fails closed.
+            matches = []
+            for candidate in added:
+                try:
+                    candidate_url, _ = self._parse_page(
+                        self._axi("selectpage", candidate, "--full")
+                    )
+                except HarnessError:
+                    continue
+                if candidate_url == url:
+                    matches.append(candidate)
+            if len(matches) != 1:
+                raise HarnessError("newly opened page is not uniquely identifiable")
+            added = matches
         handle = added[0]
         self.tabs.append((handle, package, url))
         self.sleeper(self.render_interval)
@@ -1313,7 +1335,9 @@ def run_axi(
         code = Converger(
             manifest, ledger, driver, stop_before_save=stop_before_save
         ).run()
-    except Exception:
+    except Exception as error:
+        # Redaction-safe: HarnessError messages are fixed internal strings.
+        _debug_classify(f"harness-exception={type(error).__name__}: {error}")
         package = next(
             (
                 candidate
