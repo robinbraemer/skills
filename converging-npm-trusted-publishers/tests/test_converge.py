@@ -7,6 +7,20 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+
+# Entrypoint-level tests construct the driver with its default sleeper; stub
+# real sleeping for the whole module so settle/pacing retries stay instant.
+_SLEEP_PATCHER = mock.patch("time.sleep", lambda _: None)
+
+
+def setUpModule():
+    _SLEEP_PATCHER.start()
+
+
+def tearDownModule():
+    _SLEEP_PATCHER.stop()
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "converge.py"
@@ -506,6 +520,7 @@ class FakeAxiTransport:
         disabled_field=None,
         edit_prefill_override=None,
         settle_after=0,
+        dead_until_reload=False,
     ):
         self.url = url
         self.package_heading = package_heading
@@ -526,6 +541,7 @@ class FakeAxiTransport:
         self.disabled_field = disabled_field
         self.edit_prefill_override = edit_prefill_override
         self.settle_after = settle_after
+        self.dead_until_reload = dead_until_reload
         self.snapshots_rendered = 0
         self.editing = False
         self.values = {label: "" for label in FIELD_IDS}
@@ -548,7 +564,8 @@ class FakeAxiTransport:
             page_id = str(self.next_page_id)
             self.next_page_id += 1
             self.pages[page_id] = args[1]
-            self.selected = page_id
+            if "--background" not in args:
+                self.selected = page_id
             return self._page_output()
         if command == "pages":
             # Mirror the pinned CLI's real output: the url column carries a
@@ -574,6 +591,7 @@ class FakeAxiTransport:
             self.focused = None
             self.save_clicked = False
             self.editing = False
+            self.dead_until_reload = False
             self.values = {label: "" for label in FIELD_IDS}
             self.checked = set()
             return self._page_output()
@@ -845,7 +863,7 @@ class FakeAxiTransport:
     def _page_output(self):
         self.generation += 1
         self.snapshots_rendered += 1
-        if self.snapshots_rendered <= self.settle_after:
+        if self.dead_until_reload or self.snapshots_rendered <= self.settle_after:
             # Simulate npm's SPA before hydration: chrome only, no publisher
             # section or package heading yet.
             skeleton = [
@@ -956,7 +974,9 @@ class AxiAdapterContractTests(unittest.TestCase):
 
         self.assertEqual(handle, "1")
         self.assertEqual(fake.calls[0], ("pages",))
-        self.assertEqual(fake.calls[1], ("newpage", PACKAGE_URL, "--full"))
+        self.assertEqual(
+            fake.calls[1], ("newpage", PACKAGE_URL, "--background", "--full")
+        )
 
     def test_adapter_rejects_wrong_origin_path_or_package_identity(self):
         for url in (
@@ -1386,6 +1406,31 @@ class RenderSettleAndTabCleanupTests(unittest.TestCase):
         observation = driver.inspect(handle, "@example/widgets", model_publisher())
 
         self.assertEqual(observation.reason, "identity-mismatch")
+
+    def test_dead_page_is_reloaded_once_before_classifying(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(repository="widgets", workflow="release.yml"),
+            dead_until_reload=True,
+        )
+        driver = make_driver(fake)
+        handle = open_widget(driver)
+
+        observation = driver.inspect(handle, "@example/widgets", model_publisher())
+
+        self.assertEqual(observation, MODULE.Observation("exact"))
+        reloads = [call for call in fake.calls if call[0] == "open"]
+        self.assertEqual(len(reloads), 1)
+        self.assertEqual(reloads[0][1], PACKAGE_URL)
+
+    def test_tabs_open_in_background_without_stealing_focus(self):
+        fake = FakeAxiTransport()
+        driver = make_driver(fake)
+
+        open_widget(driver)
+
+        newpage_calls = [call for call in fake.calls if call[0] == "newpage"]
+        self.assertEqual(len(newpage_calls), 1)
+        self.assertIn("--background", newpage_calls[0])
 
     def test_run_closes_only_its_own_tabs_on_success_and_on_stop(self):
         for state, expect_code in (

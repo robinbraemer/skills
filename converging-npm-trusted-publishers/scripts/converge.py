@@ -497,7 +497,7 @@ class AxiDriver:
         poll_interval: float = 0.5,
         render_attempts: int = 5,
         render_interval: float = 1.0,
-        sleeper: Callable[[float], None] = time.sleep,
+        sleeper: Callable[[float], None] | None = None,
     ):
         run = getattr(transport, "run", None)
         if not callable(run):
@@ -511,7 +511,8 @@ class AxiDriver:
         self.poll_interval = poll_interval
         self.render_attempts = render_attempts
         self.render_interval = render_interval
-        self.sleeper = sleeper
+        # Late-bound so tests patching time.sleep take effect.
+        self.sleeper = time.sleep if sleeper is None else sleeper
         self.tabs: list[tuple[str, str, str]] = []
 
     # --- restricted CLI boundary ---
@@ -645,12 +646,15 @@ class AxiDriver:
 
     def open_package(self, package: str, url: str) -> str:
         before = set(self._page_ids())
-        self._axi("newpage", url, "--full")
+        # Background tabs avoid stealing the user's focus; pacing the opens
+        # avoids tripping npm's rate limiting with a burst of page loads.
+        self._axi("newpage", url, "--background", "--full")
         added = [page_id for page_id in self._page_ids() if page_id not in before]
         if len(added) != 1:
             raise HarnessError("newly opened page is not uniquely identifiable")
         handle = added[0]
         self.tabs.append((handle, package, url))
+        self.sleeper(self.render_interval)
         return handle
 
     def close_tabs(self) -> None:
@@ -886,29 +890,42 @@ class AxiDriver:
         ):
             raise HarnessError("staged form read-back mismatch")
 
+    def _page_ready(self, url: str, tree: list[AxNode], package: str) -> bool:
+        return (
+            url == package_url(package)
+            and len(self._package_headings(tree, package)) == 1
+            and len(self._matches(tree, "heading", SECTION_HEADING)) == 1
+            and bool(
+                self._matches(tree, "button", EDIT_BUTTON_LABEL)
+                or self._matches(tree, "button", SAVE_BUTTON_LABEL)
+            )
+        )
+
     def _settled_page(self, handle: Any, package: str) -> tuple[str, list[AxNode]]:
         """Select the tab and wait briefly for the SPA to finish rendering.
 
         npm hydrates the access page after load; a snapshot taken too early
-        lacks the package heading or publisher section. Re-snapshot a bounded
-        number of times until the identity anchors and a publisher view are
-        present, then hand the tree to the normal fail-closed checks (which
-        still stop the run if the page never settles).
+        lacks the package heading or publisher section, and a burst of page
+        loads can serve a transient error page. Re-snapshot a bounded number
+        of times, and if the page still has not settled, reload the canonical
+        package URL once and settle again. The normal fail-closed checks run
+        on whatever the page finally shows.
         """
         url, tree = self._parse_page(self._axi("selectpage", handle, "--full"))
-        for _ in range(self.render_attempts - 1):
-            if (
-                url == package_url(package)
-                and len(self._package_headings(tree, package)) == 1
-                and len(self._matches(tree, "heading", SECTION_HEADING)) == 1
-                and (
-                    self._matches(tree, "button", EDIT_BUTTON_LABEL)
-                    or self._matches(tree, "button", SAVE_BUTTON_LABEL)
+        for round_index in range(2):
+            for _ in range(self.render_attempts - 1):
+                if self._page_ready(url, tree, package):
+                    return url, tree
+                self.sleeper(self.render_interval)
+                url, tree = self._parse_page(self._axi("snapshot", "--full"))
+            if self._page_ready(url, tree, package):
+                return url, tree
+            if round_index == 0:
+                # One canonical reload for transient error/stalled pages.
+                _debug_classify(f"{package}: settle-reload=True")
+                url, tree = self._parse_page(
+                    self._axi("open", package_url(package), "--full")
                 )
-            ):
-                break
-            self.sleeper(self.render_interval)
-            url, tree = self._parse_page(self._axi("snapshot", "--full"))
         return url, tree
 
     # --- driver surface used by the converger ---
@@ -929,8 +946,16 @@ class AxiDriver:
                 step_up = bool(
                     self._matches(tree, "heading", "Two-Factor Authentication")
                 )
+                level1_count = len(
+                    [
+                        node
+                        for node in tree
+                        if node.role == "heading" and node.attrs.get("level") == "1"
+                    ]
+                )
                 _debug_classify(
                     f"{package}: package-heading-unique=False "
+                    f"level1-headings={level1_count} nodes={len(tree)} "
                     f"auth-step-up-detected={step_up}"
                 )
                 return Observation("blocked", "identity-mismatch")
