@@ -1446,6 +1446,37 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(fake.values["Repository*"], "widgets")
         self.assertEqual(fake.publisher_state["repository"], "widgets-old")
 
+    def test_verify_only_and_stop_before_save_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(directory, valid_manifest())
+            with self.assertRaises(SystemExit):
+                MODULE.main(
+                    [
+                        "--manifest",
+                        str(manifest_path),
+                        "--ledger",
+                        str(Path(directory) / "ledger.json"),
+                        "--stop-before-save",
+                        "--verify-only",
+                    ]
+                )
+
+    def test_cli_verify_only_forbids_ledger_and_requires_it_otherwise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(directory, valid_manifest())
+            with self.assertRaises(SystemExit):
+                MODULE.main(
+                    [
+                        "--manifest",
+                        str(manifest_path),
+                        "--ledger",
+                        str(Path(directory) / "ledger.json"),
+                        "--verify-only",
+                    ]
+                )
+            with self.assertRaises(SystemExit):
+                MODULE.main(["--manifest", str(manifest_path)])
+
     def test_debug_classify_prints_only_redaction_safe_tuple_data(self):
         fake = FakeAxiTransport(
             publisher_state=summary_state(owner="other-org", repository="legacy")
@@ -1602,6 +1633,224 @@ class RenderSettleAndTabCleanupTests(unittest.TestCase):
                         )
                 self.assertEqual(code, expect_code)
                 self.assertEqual(set(fake.pages), {"0"})
+
+
+class RouterTransport:
+    """Purpose-built multi-package fake for --verify-only.
+
+    Unlike FakeAxiTransport (one page-id space per instance, meant for
+    single-package driver tests), this maintains ONE shared page registry
+    across several packages the way the real pinned CLI's `pages` command
+    does, and renders each open tab from a small per-package state
+    descriptor: ("existing", owner, repo, workflow, actions), ("absent",),
+    or ("unreadable",) (page never shows the Trusted Publisher heading).
+    """
+
+    def __init__(self, states: dict[str, tuple]):
+        self.states = states
+        self.pages: dict[str, str] = {}
+        self.next_id = 1
+        self.selected: str | None = None
+        self.generation = 0
+        self.calls: list[tuple] = []
+
+    def run(self, *args):
+        self.calls.append(args)
+        command = args[0]
+        if command == "pages":
+            if not self.pages:
+                return MODULE.AxiResult(0, "pages: 0 pages open\n")
+            rows = [f"  {page_id},npm,false" for page_id in self.pages]
+            body = "\n".join(
+                [f"pages[{len(rows)}]{{id,url,selected}}:", *rows, "help[1]:", "  x"]
+            )
+            return MODULE.AxiResult(0, body + "\n")
+        if command == "newpage":
+            url = args[1]
+            package = next(
+                pkg for pkg in self.states if MODULE.package_url(pkg) == url
+            )
+            page_id = str(self.next_id)
+            self.next_id += 1
+            self.pages[page_id] = package
+            self.selected = page_id
+            return self._render()
+        if command == "selectpage":
+            if args[1] not in self.pages:
+                return MODULE.AxiResult(1, 'error: "no such page"\ncode: VALIDATION_ERROR\n')
+            self.selected = args[1]
+            return self._render()
+        if command == "snapshot":
+            return self._render()
+        if command == "open":
+            return self._render()
+        if command == "closepage":
+            self.pages.pop(args[1], None)
+            return MODULE.AxiResult(0, f"status: closed\npageId: {args[1]}\n")
+        return MODULE.AxiResult(1, f'error: "unsupported: {command}"\ncode: VALIDATION_ERROR\n')
+
+    def _uid(self, node_id: str) -> str:
+        return f"uid=g{self.generation}:{node_id}"
+
+    def _render(self):
+        self.generation += 1
+        package = self.pages[self.selected]
+        state = self.states[package]
+        lines = [
+            f'{self._uid("1_0")} RootWebArea "npm" url="{MODULE.package_url(package)}" '
+            "focusable focused"
+        ]
+        if state[0] == "unreadable":
+            lines.append(f'  {self._uid("1_1")} heading "Something else" level="1"')
+        else:
+            lines.append(f'  {self._uid("1_1")} heading "{package}" level="1"')
+            lines.append(f'  {self._uid("1_2")} heading "Trusted Publisher" level="1"')
+            if state[0] == "existing":
+                _, owner, repository, workflow, actions = state
+                coordinate = f"{owner}/{repository}"
+                lines.extend(
+                    [
+                        f'  {self._uid("2_1")} StaticText "{coordinate}"',
+                        f'  {self._uid("2_2")} StaticText "{workflow}"',
+                        f'  {self._uid("2_3")} StaticText "Permissions: "',
+                    ]
+                )
+                for index, action in enumerate(sorted(actions)):
+                    lines.append(f'  {self._uid(f"2_{4 + index}")} StaticText "{action}"')
+                lines.append(
+                    f'  {self._uid("2_10")} button "Edit" '
+                    f'description="{coordinate} {workflow}"'
+                )
+                lines.append(
+                    f'  {self._uid("2_11")} button "Delete OIDC trusted publisher connection"'
+                )
+            elif state[0] == "absent":
+                lines.append(
+                    f'  {self._uid(COMBO_ID)} combobox "Publisher*" expandable haspopup="menu"'
+                )
+                lines.append(f'  {self._uid("1_36")} StaticText "GitHub Actions"')
+                for field, node_id in FIELD_IDS.items():
+                    lines.append(f'  {self._uid(node_id)} textbox "{field}" focusable')
+                for label, node_id in ACTION_IDS.items():
+                    lines.append(f'  {self._uid(node_id)} checkbox "{label}"')
+                lines.append(f'  {self._uid(SAVE_ID)} button "{SAVE_LABEL}"')
+        body = "\n".join(
+            ["page:", '  title: "npm"', f"  refs: {len(lines)}", "snapshot:", *lines]
+        )
+        return MODULE.AxiResult(0, body + "\n")
+
+
+class VerifyOnlyTests(unittest.TestCase):
+    def write_manifest(self, directory, data):
+        path = Path(directory) / "manifest.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_survey_covers_every_package_including_unreadable_ones(self):
+        # Four distinct states in one manifest, with the unreadable one placed
+        # SECOND (not last) so a naive "stop the loop on first unreadable"
+        # implementation would truncate the report and this test would catch
+        # it. A blocked or unreadable package must never hide the packages
+        # that come after it.
+        packages = ("@example/alpha", "@example/delta", "@example/beta", "@example/gamma")
+        states = {
+            packages[0]: ("existing", "example-org", "widgets", "release.yml", {"npm publish"}),
+            packages[1]: ("unreadable",),
+            packages[2]: ("existing", "other-org", "legacy", "publish.yml", {"npm publish"}),
+            packages[3]: ("absent",),
+        }
+        transport = RouterTransport(states)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(
+                directory, valid_manifest(packages=list(packages))
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = MODULE.run_verify_only(
+                    manifest_path=str(manifest_path), transport=transport
+                )
+        text = output.getvalue()
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"{packages[0]}: existing example-org/widgets release.yml", text)
+        self.assertIn(f"{packages[1]}: unreadable", text)
+        self.assertIn(f"{packages[2]}: existing other-org/legacy publish.yml", text)
+        self.assertIn(f"{packages[3]}: absent", text)
+        # All four packages produced exactly one report line each - none were
+        # skipped because an earlier one was unreadable or off-target.
+        report_lines = [line for line in text.splitlines() if line.strip()]
+        self.assertEqual(len(report_lines), len(packages))
+        for package in packages:
+            self.assertEqual(
+                sum(1 for line in report_lines if line.startswith(f"{package}: ")), 1
+            )
+
+    def test_survey_issues_zero_write_capable_commands(self):
+        packages = ("@example/alpha", "@example/beta")
+        states = {
+            packages[0]: ("existing", "example-org", "widgets", "release.yml", {"npm publish"}),
+            packages[1]: ("absent",),
+        }
+        transport = RouterTransport(states)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(
+                directory, valid_manifest(packages=list(packages))
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                MODULE.run_verify_only(manifest_path=str(manifest_path), transport=transport)
+
+        issued = {call[0] for call in transport.calls}
+        self.assertLessEqual(issued, set(MODULE.AXI_ALLOWED_COMMANDS))
+        self.assertNotIn("click", issued)
+        self.assertNotIn("press", issued)
+        self.assertNotIn("open", issued)
+        # Every opened tab was closed again.
+        self.assertEqual(transport.pages, {})
+
+    def test_verify_only_never_creates_a_ledger_file(self):
+        transport = RouterTransport(
+            {"@example/widgets": ("existing", "example-org", "widgets", "release.yml", {"npm publish"})}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(directory, valid_manifest())
+            with contextlib.redirect_stdout(io.StringIO()):
+                MODULE.run_verify_only(manifest_path=str(manifest_path), transport=transport)
+
+            self.assertEqual(list(Path(directory).glob("*ledger*")), [])
+
+    def test_verify_only_redacts_harness_exceptions(self):
+        class RaisingRouter(RouterTransport):
+            def run(self, *args):
+                if args[0] == "newpage":
+                    raise RuntimeError("sensitive browser detail")
+                return super().run(*args)
+
+        transport = RaisingRouter(
+            {"@example/widgets": ("existing", "example-org", "widgets", "release.yml", {"npm publish"})}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = self.write_manifest(directory, valid_manifest())
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = MODULE.run_verify_only(
+                    manifest_path=str(manifest_path), transport=transport
+                )
+
+        self.assertEqual(code, 5)
+        self.assertNotIn("sensitive", output.getvalue())
+
+    def test_verify_only_invalid_manifest_fails_closed_before_any_browser_action(self):
+        transport = RouterTransport({})
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = MODULE.run_verify_only(
+                    manifest_path=str(manifest_path), transport=transport
+                )
+
+        self.assertEqual(code, 2)
+        self.assertEqual(transport.calls, [])
 
 
 class AxiStaleRefTests(unittest.TestCase):

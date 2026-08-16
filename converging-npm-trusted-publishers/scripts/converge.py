@@ -993,6 +993,66 @@ class AxiDriver:
             _debug_classify(f"{package}: ui-drift ({error})")
             return Observation("blocked", "ui-drift")
 
+    def describe_publisher(self, handle: Any, package: str) -> dict[str, Any]:
+        """Read-only status report: what publisher tuple npm shows right now.
+
+        Unlike inspect(), this never classifies against a target/previous
+        tuple and never raises past this point - a package that cannot be
+        read gets an "unreadable" descriptor instead of stopping the survey,
+        so one drifted or slow-to-render package never hides the status of
+        the other packages in the same run. The publisher tuple itself is
+        public npm configuration (visible to anyone who opens the page), so
+        it is safe to surface in full here.
+        """
+        try:
+            url, tree = self._settled_page(handle, package)
+            if url != package_url(package):
+                return {"view": "unreadable", "reason": "identity-mismatch"}
+            if len(self._package_headings(tree, package)) != 1:
+                step_up = bool(
+                    self._matches(tree, "heading", "Two-Factor Authentication")
+                )
+                return {
+                    "view": "unreadable",
+                    "reason": "auth-step-up-required" if step_up else "identity-mismatch",
+                }
+            if len(self._matches(tree, "heading", SECTION_HEADING)) != 1:
+                return {"view": "unreadable", "reason": "ui-drift"}
+            if self._matches(tree, "button", EDIT_BUTTON_LABEL):
+                owner, repository, workflow, actions = self._summary(tree)
+                return {
+                    "view": "existing",
+                    "owner": owner,
+                    "repository": repository,
+                    "workflow": workflow,
+                    "allowed_actions": sorted(actions),
+                }
+            controls = self._form(tree)
+            values = {field: self._field_value(controls[field]) for field in FIELD_LABELS}
+            checked = sorted(
+                action for action in SUPPORTED_ACTIONS if self._checked(controls[action])
+            )
+            if all(value == "" for value in values.values()) and not checked:
+                return {"view": "absent"}
+            return {
+                "view": "unsaved-form",
+                "owner": values["owner"],
+                "repository": values["repository"],
+                "workflow": values["workflow"],
+                "allowed_actions": checked,
+            }
+        except HarnessError as error:
+            return {"view": "unreadable", "reason": f"ui-drift ({error})"}
+
+    def describe_all(
+        self, packages: Mapping[str, Any]
+    ) -> dict[str, dict[str, Any]]:
+        """Describe every already-opened package tab, never stopping early."""
+        return {
+            package: self.describe_publisher(handle, package)
+            for package, handle in packages.items()
+        }
+
     def _classify_summary(
         self, tree: list[AxNode], publisher: Publisher, previous: Publisher | None
     ) -> Observation:
@@ -1024,6 +1084,7 @@ class AxiDriver:
             if self._checked(controls[action]) is True
         }
         if all(value == "" for value in values.values()) and not checked:
+            _debug_classify("create-form empty: no existing publisher (absent)")
             return Observation("absent")
         if values == _desired_values(publisher) and checked == set(
             publisher.allowed_actions
@@ -1350,6 +1411,59 @@ def _print_ledger(manifest: Manifest, ledger: LedgerStore) -> None:
         print(f"{package}: {record['status']}{suffix}")
 
 
+def _print_report(manifest: Manifest, report: Mapping[str, dict[str, Any]]) -> None:
+    for package in manifest.packages:
+        if package not in report:
+            raise HarnessError("verify-only report is missing a manifest package")
+        entry = report[package]
+        if entry["view"] == "unreadable":
+            print(f"{package}: unreadable ({entry['reason']})")
+        elif entry["view"] == "absent":
+            print(f"{package}: absent (no trusted publisher configured)")
+        else:
+            label = "existing" if entry["view"] == "existing" else "unsaved-form"
+            actions = ",".join(entry["allowed_actions"]) or "none"
+            print(
+                f"{package}: {label} {entry['owner']}/{entry['repository']} "
+                f"{entry['workflow']} actions=[{actions}]"
+            )
+
+
+def run_verify_only(*, manifest_path: str, transport: Any) -> int:
+    """Strict read-only status survey: opens every package tab, reports what
+    publisher tuple npm currently shows, and never stages, types, clicks, or
+    touches the ledger. A package that cannot be read is reported as
+    unreadable instead of stopping the sweep, so the report always covers
+    every package in the manifest.
+    """
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError:
+        print("blocked: invalid manifest")
+        return 2
+
+    driver = None
+    try:
+        driver = AxiDriver(transport)
+        handles = {
+            package: driver.open_package(package, package_url(package))
+            for package in manifest.packages
+        }
+        report = driver.describe_all(handles)
+        _print_report(manifest, report)
+        return 0
+    except Exception as error:
+        _debug_classify(f"harness-exception={type(error).__name__}: {error}")
+        print("blocked: restricted harness failure during verify-only survey")
+        return 5
+    finally:
+        if driver is not None:
+            try:
+                driver.close_tabs()
+            except Exception:
+                pass
+
+
 def run_axi(
     *,
     manifest_path: str,
@@ -1403,7 +1517,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Converge npm Trusted Publishers through the pinned chrome-devtools-axi CLI."
     )
     parser.add_argument("--manifest", required=True, help="user-approved manifest JSON path")
-    parser.add_argument("--ledger", required=True, help="local resume ledger path")
+    parser.add_argument(
+        "--ledger",
+        required=False,
+        default=None,
+        help="local resume ledger path (required unless --verify-only)",
+    )
     parser.add_argument(
         "--axi-script",
         default=None,
@@ -1416,11 +1535,22 @@ def main(argv: list[str] | None = None) -> int:
         help="stage and verify the first pending package, then stop before Save/authentication",
     )
     parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="strict read-only report: run the global inspect sweep and exit before any staging, keystroke, or Save",
+    )
+    parser.add_argument(
         "--debug-classify",
         action="store_true",
         help="print redaction-safe classifier diagnostics (booleans and the public publisher tuple only)",
     )
     arguments = parser.parse_args(argv)
+    if arguments.stop_before_save and arguments.verify_only:
+        parser.error("--stop-before-save and --verify-only are mutually exclusive")
+    if arguments.verify_only and arguments.ledger is not None:
+        parser.error("--verify-only never touches a ledger; omit --ledger")
+    if not arguments.verify_only and arguments.ledger is None:
+        parser.error("--ledger is required unless --verify-only is set")
     if arguments.debug_classify:
         global DEBUG_CLASSIFY
         DEBUG_CLASSIFY = True
@@ -1432,6 +1562,9 @@ def main(argv: list[str] | None = None) -> int:
     except HarnessError:
         print("blocked: pinned chrome-devtools-axi runtime is unavailable")
         return 5
+
+    if arguments.verify_only:
+        return run_verify_only(manifest_path=arguments.manifest, transport=transport)
 
     return run_axi(
         manifest_path=arguments.manifest,
