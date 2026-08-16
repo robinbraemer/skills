@@ -227,7 +227,7 @@ class FakeDriver:
     def migrate_stage(self, handle, previous, publisher):
         self.calls.append(("migrate", handle))
 
-    def save_and_wait(self, handle):
+    def save_and_wait(self, handle, publisher):
         self.calls.append(("save", handle))
         return self.save_outcomes[handle].pop(0)
 
@@ -524,6 +524,8 @@ class FakeAxiTransport:
         newpage_error=False,
         newpage_creates_tab=True,
         extra_tab_on_newpage=False,
+        save_requires_stepup=0,
+        wander_after_save=False,
     ):
         self.url = url
         self.package_heading = package_heading
@@ -548,6 +550,9 @@ class FakeAxiTransport:
         self.newpage_error = newpage_error
         self.newpage_creates_tab = newpage_creates_tab
         self.extra_tab_on_newpage = extra_tab_on_newpage
+        self.save_requires_stepup = save_requires_stepup
+        self.wander_after_save = wander_after_save
+        self.stepup_pending = 0
         self.foreign_pages = set()
         self.snapshots_rendered = 0
         self.editing = False
@@ -661,16 +666,24 @@ class FakeAxiTransport:
                 return self._page_output()
         if node_id == SAVE_ID and not self.save_disabled:
             self.save_clicked = True
-            if self.save_result == "success" and self.commit_on_save:
-                self.publisher_state = {
-                    "owner": self.values[FIELD_LABELS["owner"]],
-                    "repository": self.values[FIELD_LABELS["repository"]],
-                    "workflow": self.values[FIELD_LABELS["workflow"]],
-                    "actions": set(self.checked),
-                }
-                self.editing = False
+            if self.wander_after_save:
+                self.package_heading = None
+            if self.save_requires_stepup:
+                self.stepup_pending = self.save_requires_stepup
+            else:
+                self._commit_form()
             return self._page_output()
         return self._page_output()
+
+    def _commit_form(self):
+        if self.save_result == "success" and self.commit_on_save:
+            self.publisher_state = {
+                "owner": self.values[FIELD_LABELS["owner"]],
+                "repository": self.values[FIELD_LABELS["repository"]],
+                "workflow": self.values[FIELD_LABELS["workflow"]],
+                "actions": set(self.checked),
+            }
+            self.editing = False
 
     def _press(self, key):
         if self.focused is None:
@@ -886,6 +899,25 @@ class FakeAxiTransport:
             ]
             body = "\n".join(
                 ["page:", '  title: "other"', f"  refs: {len(foreign)}", "snapshot:", *foreign]
+            )
+            return MODULE.AxiResult(0, body + "\n")
+        if self.stepup_pending > 0:
+            # npm's write step-up: the package page is replaced in place by
+            # the 2FA challenge until the human authenticates.
+            self.stepup_pending -= 1
+            if self.stepup_pending == 0:
+                self._commit_form()
+            challenge = [
+                f'{self._uid("1_0")} RootWebArea "npm | Security Key" url="{self.url}" focusable focused',
+                *self._chrome_prefix_lines(),
+                f'    {self._uid("8_1")} heading "Two-Factor Authentication" level="1"',
+                f'    {self._uid("8_2")} heading "Security key" level="2"',
+                f'    {self._uid("8_3")} StaticText "Click the button below when you are ready to authenticate."',
+                f'    {self._uid("8_4")} button "Use security key"',
+                f'    {self._uid("8_5")} button "Use password"',
+            ]
+            body = "\n".join(
+                ["page:", '  title: "npm | Security Key"', f"  refs: {len(challenge)}", "snapshot:", *challenge]
             )
             return MODULE.AxiResult(0, body + "\n")
         if self.dead_until_reload or self.snapshots_rendered <= self.settle_after:
@@ -1158,7 +1190,7 @@ class AxiInteractionTests(unittest.TestCase):
         driver, handle = self.staged_driver(fake)
 
         driver.stage(handle, model_publisher())
-        outcome = driver.save_and_wait(handle)
+        outcome = driver.save_and_wait(handle, model_publisher())
 
         self.assertEqual(outcome, "save-failed")
         self.assertFalse(fake.save_clicked)
@@ -1177,7 +1209,7 @@ class AxiInteractionTests(unittest.TestCase):
                 fake = FakeAxiTransport(save_result=result, commit_on_save=False)
                 driver, handle = self.staged_driver(fake, poll_attempts=2)
                 driver.stage(handle, model_publisher())
-                self.assertEqual(driver.save_and_wait(handle), expected)
+                self.assertEqual(driver.save_and_wait(handle, model_publisher()), expected)
 
     def test_authentication_status_cannot_be_overridden_by_publisher_success(self):
         for message, expected in (
@@ -1193,14 +1225,47 @@ class AxiInteractionTests(unittest.TestCase):
                 )
                 driver, handle = self.staged_driver(fake)
                 driver.stage(handle, model_publisher())
-                self.assertEqual(driver.save_and_wait(handle), expected)
+                self.assertEqual(driver.save_and_wait(handle, model_publisher()), expected)
+
+    def test_save_waits_through_write_stepup_until_target_summary_appears(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(), save_requires_stepup=3
+        )
+        driver, handle = self.staged_driver(fake, poll_attempts=8)
+        driver.migrate_stage(handle, model_previous(), model_publisher())
+
+        outcome = driver.save_and_wait(handle, model_publisher())
+
+        self.assertEqual(outcome, "success")
+        self.assertEqual(fake.publisher_state["repository"], "widgets")
+
+    def test_save_stepup_never_completed_is_ambiguous_not_failed(self):
+        fake = FakeAxiTransport(
+            publisher_state=summary_state(), save_requires_stepup=10**6
+        )
+        driver, handle = self.staged_driver(fake, poll_attempts=3)
+        driver.migrate_stage(handle, model_previous(), model_publisher())
+
+        outcome = driver.save_and_wait(handle, model_publisher())
+
+        self.assertEqual(outcome, "authentication-ambiguous")
+        self.assertEqual(fake.publisher_state["repository"], "widgets-old")
+
+    def test_save_page_losing_identity_without_challenge_fails(self):
+        fake = FakeAxiTransport(wander_after_save=True, commit_on_save=False)
+        driver, handle = self.staged_driver(fake)
+        driver.stage(handle, model_publisher())
+
+        outcome = driver.save_and_wait(handle, model_publisher())
+
+        self.assertEqual(outcome, "save-failed")
 
     def test_save_wait_rejects_stale_success(self):
         fake = FakeAxiTransport(save_result="none", stale_success=True)
         driver, handle = self.staged_driver(fake, poll_attempts=2)
         driver.stage(handle, model_publisher())
 
-        outcome = driver.save_and_wait(handle)
+        outcome = driver.save_and_wait(handle, model_publisher())
 
         self.assertEqual(outcome, "authentication-ambiguous")
 

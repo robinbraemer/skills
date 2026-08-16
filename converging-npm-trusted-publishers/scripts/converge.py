@@ -1105,7 +1105,25 @@ class AxiDriver:
             if node.role in {"alert", "status"}
         )
 
-    def save_and_wait(self, handle: Any) -> str:
+    def _auth_challenge_shown(self, tree: list[AxNode]) -> bool:
+        return bool(
+            self._matches(tree, "heading", "Two-Factor Authentication")
+            or self._matches(tree, "heading", "Security key")
+        )
+
+    def _summary_shows_target(
+        self, tree: list[AxNode], publisher: Publisher
+    ) -> bool:
+        """True when the persisted summary view already proves the target."""
+        try:
+            owner, repository, workflow, actions = self._summary(tree)
+        except HarnessError:
+            return False
+        return (owner, repository, workflow, None) == publisher.tuple_key() and (
+            actions == set(publisher.allowed_actions)
+        )
+
+    def save_and_wait(self, handle: Any, publisher: Publisher) -> str:
         _, tree, controls = self._current(handle)
         save = controls["save"]
         if "disabled" in save.attrs:
@@ -1118,7 +1136,21 @@ class AxiDriver:
             if url != expected_url:
                 return "save-failed"
             if len(self._package_headings(tree, package)) != 1:
+                # Writes trigger npm's 2FA step-up in place: the package page
+                # is replaced by the challenge at the same URL. That is the
+                # human's turn, not a failure - keep waiting.
+                if self._auth_challenge_shown(tree):
+                    _debug_classify(f"{package}: awaiting-human-2fa=True")
+                    if attempt + 1 < self.poll_attempts:
+                        self.sleeper(self.poll_interval)
+                        url, tree = self._parse_page(self._axi("snapshot", "--full"))
+                    continue
                 return "save-failed"
+            if self._summary_shows_target(tree, publisher):
+                # npm re-rendered the persisted summary with the target tuple:
+                # stronger success proof than any banner. The converger still
+                # reloads and read-back-verifies afterwards.
+                return "success"
             messages = self._messages(tree) - baseline_messages
             new_messages = [
                 (role, message.casefold()) for role, message in messages.elements()
@@ -1283,7 +1315,7 @@ class Converger:
                 f"{package}: saving now - complete the security-key prompt in Chrome",
                 flush=True,
             )
-            outcome = self.driver.save_and_wait(handle)
+            outcome = self.driver.save_and_wait(handle, publisher)
             if outcome != "success":
                 reason = {
                     "authentication-failed": "authentication-failed",
